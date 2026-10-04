@@ -82,3 +82,7 @@ interface DecisionError {
 - Clef: developers.cloudflare.com/workers-ai/models/clef/ (+ `schema-input.json` — 64 q, 2–255 options, 2–10 levels, images, truncation note, $0.24/M, 65,536 ctx), blog.cloudflare.com/clef-decision-models/ (benchmarks, latency, pricing, training), developers.cloudflare.com/workers-ai/platform/limits/ (rate-limit structure, Paid-plan 20/50 rpm table)
 - flaviocopes.com/clef (compatibility deep-dive: envelope, 5006, custom-fetch SDK adapter, measured latency, Neuron math, image gotchas) and flaviocopes.com/jev-nodejs (`@typesafe-ai/sdk` full surface: `systemOne()`, options, retries, error classes)
 - Footnote: docs.system-one.dev/en/docs/api examined and identified as a third-party gateway (32 q/req, 64 KiB body, 120 rpm/account) — **not** the TypeSafe contract; excluded from the table above.
+
+## Comments
+
+Update (user): TypeSafe signups remain paused, but a **freejev** API key (Jev-compatible, 1 req/min) is available for smoke tests — see ticket 05. This does not change the contract table above; it changes which profile the spike can exercise first.
