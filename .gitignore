@@ -1,2 +1,5 @@
 .env.local
 node_modules/
+
+spike/out/
+spike/node_modules/
