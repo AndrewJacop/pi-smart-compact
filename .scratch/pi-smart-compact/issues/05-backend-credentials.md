@@ -9,3 +9,7 @@ Blocked by:
 2. Clef: from the firm's Cloudflare setup — account id + Workers AI API token (or whatever the firm announcement grants; record the exact grant shape). Export `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`.
 
 Rules: env vars only; never committed or printed; revocable keys. Resolved when both backends answer one test question from this machine.
+
+## Comments
+
+Update (post-research, ticket 02): **TypeSafe signups are currently paused** — the Jev key may be unobtainable right now. Your firm's Clef access is the critical path; record its exact grant shape. If neither hosted key materializes, ticket 03 found a no-key fallback: `ollama pull clef-flash` serves the native Jev API on `/v1/systemone` locally, enough to unblock ticket 06.
