@@ -24,10 +24,10 @@ A validated, hand-off-ready **spec** for `pi-smart-compact`: a publishable pi ex
 - [question design inventory](issues/04-question-design-inventory.md) — proven patterns: ask call and result separately; noul for branches, score for spectra, choice for escape-hatch paths; 8-stage state-fitting ladder to 25k tokens; batch by request-token budget; uncertainty -> do-nothing; thresholds + QUESTIONS_VERSION-style invalidation live in config.
 - [backend credentials for the spike](issues/05-backend-credentials.md) — both legs live and smoke-tested: freejev fronts Jev (`typesafe/jev-1.13-20260917`, hard 1 req/min → smoke only); the firm "Clef grant" is the optollm gateway serving clef natively on `/v1/systemone` — no Cloudflare or TypeSafe keys needed; keys in gitignored `.env.local`, rotate after the spike.
 - [thin spike: decision-driven compaction end-to-end](issues/06-thin-spike.md) — pipeline works: clef −97.8% / freejev −98% region reduction; decision p50 1.1s (clef); drops 5/5 identical cross-backend; 3/3 injected failures fail open to native; friction: single-action matrix rows must be policy (clef caps choices at 26 via optollm), freejev requires idempotency-key, serialize truncation bounds verbatim keeps at 2k chars. Prototype on branch `spike/thin-spike`.
+- [decision matrix shape and defaults](issues/07-matrix-shape.md) — decision unit = block-cluster (assistant turns split into thinking/text/tool-call; six axes = six rows); row = allowed-action subset, singleton = pinned policy, never asked; hardcoded repair `call := min(call, result)`; action = argmax ∩ subset, below the backend `confidenceFloor` → keep (values = ticket 12); v1 Safe-table defaults (user/previous-summary/unknown pinned, assistant-text keep-or-summarize, thinking summarize-or-drop, tool-call keep-or-drop, tool-result full set); policy in config, judgment in code, invalid config fails loud to native.
 
 ## Not yet specified
 
-- Targeted-summarizer **output format**: reuse pi's structured compaction format vs custom; depends on how the matrix bounds the "summarize" class (ticket 07).
 - **Packaging/distribution details** — npm publish flow, `pi install` compatibility range, key-setup docs; graduates once the extension shape is settled.
 - **Per-tool override rules** in the matrix (v1.x candidate — user deferred: msg-type matrix only for v1).
 
