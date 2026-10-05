@@ -1,0 +1,20 @@
+{
+	"name": "@andrewjacop/pi-smart-compact",
+	"version": "0.1.0",
+	"description": "Decision-model compaction for pi: a decision backend classifies each compactable message keep/summarize/drop, a targeted LLM summarizes only the summarize class, and any failure falls back to native compaction.",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"files": ["extensions"],
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.0.2",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.8.0"
+	}
+}
