@@ -6,13 +6,13 @@ Shadow runs write a telemetry JSONL record (identical schema to future live) —
 
 **Blocked by:** 01 — Skeleton: package + hooks + config validation + fail-open shell.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Shadow compact on a small session: native entry persists, `[shadow]` toast shows counts + reduction, telemetry record written with units/classCounts/latency/usage
-- [ ] Assistant turns split into thinking/text/tool-call units; unknown unit types classify keep (pinned), never asked
-- [ ] Pinned rows and user/previous-summary/unknown never appear as questions; decidable rows ask exactly their row's subset
-- [ ] User questions.json override loads and validates; malformed override → loud warn + native
-- [ ] Confidence below floor → keep, with a recorded reason string; decisions carry argmax∩subset reasons
-- [ ] Pairing repair: a dropped result forces its call out of keep; no orphan results
-- [ ] Injected auth failure / timeout / HTTP 500 → native compaction, telemetry records the rung; no retry inside the hook
-- [ ] Partial garbage response → invalid units keep, valid ones survive (per-unit salvage)
+- [x] Shadow compact on a small session: native entry persists, `[shadow]` toast shows counts + reduction, telemetry record written with units/classCounts/latency/usage
+- [x] Assistant turns split into thinking/text/tool-call units; unknown unit types classify keep (pinned), never asked
+- [x] Pinned rows and user/previous-summary/unknown never appear as questions; decidable rows ask exactly their row's subset
+- [x] User questions.json override loads and validates; malformed override → loud warn + native
+- [x] Confidence below floor → keep, with a recorded reason string; decisions carry argmax∩subset reasons
+- [x] Pairing repair: no orphan results — `call := min(call, result)` per SPEC §3.6 (a kept result forces its dropped call back up; the one surviving orphan shape is a kept call whose result dropped, §6.4). The bullet's original wording "a dropped result forces its call out of keep" contradicts §3.6/§6.4 and was implemented per SPEC
+- [x] Injected auth failure / timeout / HTTP 500 → native compaction, telemetry records the rung; no retry inside the hook
+- [x] Partial garbage response → invalid units keep, valid ones survive (per-unit salvage)

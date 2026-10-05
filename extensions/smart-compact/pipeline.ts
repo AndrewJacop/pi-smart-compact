@@ -95,6 +95,19 @@ const FULL_TEXT_CAP = 2000; // stage "full": head stays inline, the tail becomes
 const GOAL_PROMPTS = 5;
 const GOAL_PROMPT_CAP = 400;
 
+interface StateRegionEntry {
+	id: string;
+	type: string;
+	chars: number;
+	text: string;
+}
+
+interface DecisionState {
+	orientation: string;
+	goal: string[];
+	region: StateRegionEntry[];
+}
+
 const ORIENTATION =
 	"A coding assistant conversation is being compacted. For each unit in the region below, choose the action " +
 	"that loses the least information needed to continue the work later: whatever is not kept is summarized or " +
@@ -105,7 +118,7 @@ function inlineText(unit: Unit): string {
 	return `${unit.text.slice(0, FULL_TEXT_CAP)}\n[... ${unit.chars} chars (omitted)]`;
 }
 
-function buildState(units: Unit[], goalPrompts: string[]): Record<string, unknown> {
+function buildState(units: Unit[], goalPrompts: string[]): DecisionState {
 	return {
 		orientation: ORIENTATION,
 		goal: goalPrompts.slice(-GOAL_PROMPTS).map((p) => (p.length > GOAL_PROMPT_CAP ? `${p.slice(0, GOAL_PROMPT_CAP)}…` : p)),
@@ -113,16 +126,19 @@ function buildState(units: Unit[], goalPrompts: string[]): Record<string, unknow
 	};
 }
 
+function estimateStateTokens(state: DecisionState): number {
+	return estimateTextTokens(JSON.stringify(state));
+}
+
 /** Crude client-side pre-trim (clef profile): strip unit texts oldest-first, pinned types last. Never partial units. */
-function fitsAfterTrim(state: Record<string, unknown>, budgetTokens: number): Record<string, unknown> | null {
-	const region = state.region as { id: string; type: string; chars: number; text: string }[];
-	const pinned = new Set<string>(["user", "previous-summary"]);
-	const trimmed = region.map((r) => ({ ...r })); // oldest-first: the loop below iterates forward
-	let tokens = Math.ceil(JSON.stringify({ ...state, region: trimmed }).length / 4);
+function fitsAfterTrim(state: DecisionState, budgetTokens: number): DecisionState | null {
+	const pinned = new Set<string>(["user", "previous-summary", "unknown"]); // unknown is pinned policy too (SPEC §3.3)
+	const trimmed = state.region.map((r) => ({ ...r })); // oldest-first: the loop below iterates forward
+	let tokens = estimateStateTokens({ ...state, region: trimmed });
 	for (let i = 0; i < trimmed.length && tokens > budgetTokens; i++) {
 		if (pinned.has(trimmed[i].type)) continue;
 		trimmed[i] = { id: trimmed[i].id, type: trimmed[i].type, chars: trimmed[i].chars, text: `${trimmed[i].chars} chars (omitted)` };
-		tokens = Math.ceil(JSON.stringify({ ...state, region: trimmed }).length / 4);
+		tokens = estimateStateTokens({ ...state, region: trimmed });
 	}
 	if (tokens > budgetTokens) return null;
 	return { ...state, region: trimmed };
@@ -250,7 +266,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 	const goalPrompts = units.filter((u) => u.type === "user").map((u) => u.text);
 	let state = buildState(units, goalPrompts);
 	let stage = "full";
-	let stateTokens = Math.ceil(JSON.stringify(state).length / 4);
+	let stateTokens = estimateStateTokens(state);
 	if (stateTokens > profile.stateTokenBudget) {
 		if (!profile.truncateStateClientSide) {
 			return finishFallback(mkRecord(profile.model, stage), 1, `state ${stateTokens} tok exceeds budget ${profile.stateTokenBudget} and the backend truncates nothing (state-fitting ladder: ticket 03)`);
@@ -261,7 +277,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		}
 		state = trimmed;
 		stage = "client-truncated";
-		stateTokens = Math.ceil(JSON.stringify(state).length / 4);
+		stateTokens = estimateStateTokens(state);
 	}
 
 	// Questions: one choice per askable unit, candidates = the row's allowed subset.
@@ -361,12 +377,19 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 	// Telemetry + counterfactual toast; shadow always returns native.
 	const all = units.map((u) => actions.get(u.id)).filter((d): d is UnitRecord => !!d);
 	const classCounts: Record<Action, number> = { keep: 0, summarize: 0, drop: 0 };
-	for (const d of all) classCounts[d.action]++;
 	const unitTokens = (u: Unit) => estimateTextTokens(serializeUnit(u));
-	const before = units.reduce((acc, u) => acc + unitTokens(u), 0);
-	const keptTokens = units.reduce((acc, u) => acc + (actions.get(u.id)?.action === "keep" ? unitTokens(u) : 0), 0);
-	const summarizeTokens = units.reduce((acc, u) => acc + (actions.get(u.id)?.action === "summarize" ? unitTokens(u) : 0), 0);
-	const after = keptTokens + Math.ceil(summarizeTokens / SUMMARY_ASSUMPTION) + DOC_OVERHEAD_TOKENS;
+	let before = 0;
+	const tokensByAction: Record<Action, number> = { keep: 0, summarize: 0, drop: 0 };
+	for (const u of units) {
+		const t = unitTokens(u);
+		before += t;
+		const a = actions.get(u.id);
+		if (a) {
+			classCounts[a.action]++;
+			tokensByAction[a.action] += t;
+		}
+	}
+	const after = tokensByAction.keep + Math.ceil(tokensByAction.summarize / SUMMARY_ASSUMPTION) + DOC_OVERHEAD_TOKENS;
 	const reductionPct = before > 0 ? Math.max(0, Math.round((1 - after / before) * 1000) / 10) : 0;
 
 	const record = mkRecord(profile.model, stage);

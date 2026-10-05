@@ -8,13 +8,12 @@ import { effectiveProfile, isObject, missingBackendKey, validateSmartCompact } f
 import { loadQuestionSet, runShadow } from "./pipeline.ts";
 import { appendTelemetry, telemetryDir } from "./telemetry.ts";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 const DEFAULT_QUESTIONS = fileURLToPath(new URL("./questions.default.json", import.meta.url));
 
 function overrideQuestionsPath(): string {
-	return join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "smart-compact", "questions.json");
+	return join(telemetryDir(), "questions.json");
 }
 
 function defaultMakeClient(profile: { endpoint: string }, decisionTimeoutMs: number): DecisionClient {
