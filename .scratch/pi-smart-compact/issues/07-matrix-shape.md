@@ -45,6 +45,7 @@ Per decide-question: `action = argmax(probabilities) ∩ row's allowed subset`; 
 ### Configurable vs hardcoded
 **Config (validated):** matrix rows; per-backend `confidenceFloor`; summarizer model (standing decision from charting).
 **Code (v1):** call-follows-result repair; singleton = pinned; unknown → keep; low confidence → keep; question text + QUESTIONS_VERSION hash (ticket 04's invalidation pattern); unit splitting; per-decision reason strings in the log.
+*(Amended by ticket 12, 2026-10-05: question text moved from Code to Config — ships as `questions.default.json`, user-overridable via a config `questions` file key, validated on ids + candidate caps; QUESTIONS_VERSION stamping dropped in favor of the recipe's fresh-log rule.)*
 **Invalid config** → warn loudly, smart path off, native compaction. Never guess (pi-jev's ConfigError lesson adapted to our fail-open shape).
 
 ### Sanity vs spike (ticket 06)
