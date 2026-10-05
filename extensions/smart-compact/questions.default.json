@@ -1,0 +1,18 @@
+{
+	"tool-call": {
+		"type": "choice",
+		"instructions": "Tool call {id} ({tool}) {input}: should it stay in the compacted history? Knowing this call was made, with its input, still matters for what the assistant does next."
+	},
+	"tool-result": {
+		"type": "choice",
+		"instructions": "The {resultChars}-char output of tool call {id} ({tool}): keep it verbatim, summarize it, or drop it? Re-running the tool can recover it; weigh the cost of losing the contents against the tokens it occupies."
+	},
+	"assistant-text": {
+		"type": "choice",
+		"instructions": "This assistant message: keep it verbatim or summarize it? Weigh whether its exact wording still matters for what the assistant does next."
+	},
+	"thinking": {
+		"type": "choice",
+		"instructions": "This assistant thinking block: summarize or drop it? Keep (as a summary) only what formed something durable — plans, decisions, findings — not ephemeral reasoning."
+	}
+}

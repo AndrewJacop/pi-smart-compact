@@ -59,8 +59,48 @@ export const BACKENDS: Record<string, { env: string | null }> = {
 	"jev-direct": { env: "TYPESAFE_API_KEY" }, // provisional name — §5.4 doesn't name it; confirm in ticket 08
 	ollama: { env: null },
 };
-// Shipped per-profile defaults (§5.2/§8.5: confidenceFloor 0.1 shared, clef truncateStateClientSide,
-// per-profile model/maxQuestions) land with their consumers — the adapters (tickets 02/08).
+
+/** The shipped wire-level profile per backend; the user's `profiles` entry merges over it. */
+export interface BackendProfile {
+	endpoint: string;
+	model: string;
+	maxQuestions: number;
+	stateTokenBudget: number;
+	truncateStateClientSide: boolean;
+	confidenceFloor: number;
+	/** Backend candidate-count caps for choice questions (clef/optollm enforces 2–26). */
+	candidatesMin: number;
+	candidatesMax: number;
+}
+
+/** Only clef ships in ticket 02; jev / ollama / jev-direct wire up in ticket 08. */
+export const BACKEND_PROFILES: Record<string, BackendProfile> = {
+	clef: {
+		endpoint: "https://optollm.optomatica.com/v1/systemone",
+		model: "clef",
+		maxQuestions: 64,
+		stateTokenBudget: 25000,
+		truncateStateClientSide: true, // clef silently truncates over-limit state — pre-trim (SPEC §5.2)
+		confidenceFloor: 0.1, // shared floor (SPEC §8.5)
+		candidatesMin: 2,
+		candidatesMax: 26,
+	},
+};
+
+/** Shipped defaults merged with the user's validated override; null = backend not wired yet (→ native). */
+export function effectiveProfile(backend: string, override: ProfileOverride | undefined): BackendProfile | null {
+	const shipped = BACKEND_PROFILES[backend];
+	if (!shipped) return null;
+	const p: BackendProfile = { ...shipped };
+	if (override?.model !== undefined) p.model = override.model;
+	if (override?.maxQuestions !== undefined) p.maxQuestions = override.maxQuestions;
+	if (override?.stateTokenBudget !== undefined) p.stateTokenBudget = override.stateTokenBudget;
+	if (override?.truncateStateClientSide !== undefined) p.truncateStateClientSide = override.truncateStateClientSide;
+	if (override?.confidenceFloor !== undefined) p.confidenceFloor = override.confidenceFloor;
+	return p;
+}
+// Shipped per-profile defaults (§5.2/§8.5) live in BACKEND_PROFILES above; the shipped clef
+// defaults land with their consumer — the adapters (tickets 02/08).
 
 const PROFILE_FIELDS: Record<string, "string" | "int" | "boolean" | "floor"> = {
 	model: "string",
