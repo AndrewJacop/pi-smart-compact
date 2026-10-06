@@ -7,7 +7,8 @@
 import type { CompactionResult, SessionEntry, generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { DecisionClient } from "./client.ts";
-import type { Action, BackendProfile, UnitType } from "./config.ts";
+import type { Action, BackendProfile, Privacy, UnitType } from "./config.ts";
+import { redactUnlessFull } from "./privacy.ts";
 import { decideRegion, emptyRecord, type QuestionSet, type TelemetryRecord, type UnitRecord } from "./pipeline.ts";
 import { estimateTextTokens, serializeUnit, splitUnits, type Unit } from "./units.ts";
 
@@ -40,6 +41,8 @@ export interface LiveOpts {
 	backend: string;
 	matrix: Record<UnitType, Action[]>;
 	minReductionPct: number;
+	/** SPEC §10: "redacted" (default when absent) scrubs summary-request egress; "full" passes verbatim. */
+	privacy?: Privacy;
 }
 
 export interface LiveFileOps {
@@ -209,8 +212,10 @@ export async function runLive(deps: LiveDeps, opts: LiveOpts, profile: BackendPr
 	if (summarizeMsgs.length > 0) {
 		const t1 = Date.now();
 		try {
+			// Privacy (SPEC §10): the summarizer defaults to the session model — a remote LLM — so
+			// its input is egress like the decision request (policy: privacy.ts, redactUnlessFull).
 			const instructions = [region.customInstructions, SCOPING_LINE].filter(Boolean).join("\n\n");
-			const r = await deps.summarize(summarizeMsgs, {
+			const r = await deps.summarize(redactUnlessFull(opts.privacy, summarizeMsgs), {
 				customInstructions: instructions,
 				reserveTokens: region.reserveTokens,
 				signal: region.signal,

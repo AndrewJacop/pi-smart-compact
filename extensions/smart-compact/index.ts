@@ -116,7 +116,7 @@ export async function run(
 		const prep = evt.preparation;
 		const live = await runLive(
 			{ ...decisionDeps, summarize: makeSummarizer(ctx) },
-			{ backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct },
+			{ backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct, privacy: cfg.privacy },
 			profile,
 			{
 				// Region for decision and summary: messagesToSummarize ∪ split-turn prefix (SPEC §6.7).
@@ -145,7 +145,7 @@ export async function run(
 
 	const result = await runShadow(
 		decisionDeps,
-		{ backend: cfg.backend, matrix: cfg.matrix },
+		{ backend: cfg.backend, matrix: cfg.matrix, privacy: cfg.privacy },
 		profile,
 		{ messages: messages as Array<Record<string, unknown>>, previousSummary, kind, signal: event.signal },
 	);

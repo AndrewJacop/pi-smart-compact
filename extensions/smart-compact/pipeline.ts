@@ -5,7 +5,8 @@
 // mode (ticket 04's summarizer + composer + gate) both consume it.
 import { readFileSync } from "node:fs";
 import type { DecisionBatch, DecisionClient, DecisionQuestion } from "./client.ts";
-import type { Action, BackendProfile, UnitType } from "./config.ts";
+import type { Action, BackendProfile, Privacy, UnitType } from "./config.ts";
+import { redactUnlessFull } from "./privacy.ts";
 import { callsText, estimateTextTokens, serializeUnit, splitUnits, type Unit } from "./units.ts";
 
 export type { Action };
@@ -308,6 +309,8 @@ export interface TelemetryRecord {
 export interface DecisionOpts {
 	backend: string;
 	matrix: Record<UnitType, Action[]>;
+	/** SPEC §10: "redacted" (default when absent) scrubs decision-request egress; "full" passes verbatim. */
+	privacy?: Privacy;
 }
 
 export interface ShadowDeps {
@@ -450,16 +453,24 @@ export async function decideRegion(
 		questionOf.set(u.id, { type: "choice", instructions: fillInstructions(tpl.instructions, u), criteria });
 	}
 
+	// Privacy (SPEC §10): the whole egress (state + questions) goes through redactUnlessFull
+	// ONCE, before budgeting — every batch then resends the SAME redacted state object (answers
+	// merge by id), budgets see egress-faithful sizes, and ticket-08's idempotency-key content
+	// hash (§8.4) derives post-redaction. The helper copies; raw pipeline objects stay untouched.
+	// (The ladder truncates raw text; redaction only shrinks — the redacted state still fits.)
+	const egressState = redactUnlessFull(opts.privacy, state);
+	const egressQuestions = redactUnlessFull(opts.privacy, Object.fromEntries(questionOf));
+
 	// Chunk askables into concurrent batches (SPEC §3.4): ≤ profile.maxQuestions questions per
 	// batch and state + questions within the per-request token budget. The same state is resent
 	// with every batch; answers merge by question id. Questions too big for what the budget has
 	// left default to keep.
-	const questionBudget = Math.max(0, profile.stateTokenBudget - estimateStateTokens(state));
+	const questionBudget = Math.max(0, profile.stateTokenBudget - estimateStateTokens(egressState));
 	const batches: Unit[][] = []; // (chunking detail unchanged from ticket 02)
 	let current: Unit[] = [];
 	let currentTokens = 0;
 	for (const u of askable) {
-		const q = questionOf.get(u.id);
+		const q = egressQuestions[u.id];
 		if (!q) continue;
 		const tokens = estimateTextTokens(JSON.stringify(q));
 		if (tokens > questionBudget) {
@@ -484,7 +495,7 @@ export async function decideRegion(
 		const results = await Promise.all(
 			batches.map((batch) =>
 				deps.client.decide(
-					{ state, model: profile.model, questions: Object.fromEntries(batch.map((u) => [u.id, questionOf.get(u.id)!])) },
+					{ state: egressState, model: profile.model, questions: Object.fromEntries(batch.map((u) => [u.id, egressQuestions[u.id]!])) },
 					region.signal,
 				),
 			),
