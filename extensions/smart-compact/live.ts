@@ -3,7 +3,9 @@
 // in order: previous-summary head (verbatim) → native-format LLM section →
 // `## Kept verbatim` (serialized keep-blocks, orphan-only drop markers) → file tags.
 // The reduction gate (rung 4) guards the context delta; summarizer failure → native
-// (rung 3, no salvage, no retry). Branch summaries join the pipeline in ticket 07.
+// (rung 3, no salvage, no retry). Branch summaries run the same pipeline (ticket 07, SPEC §9):
+// kind "branch" — same matrix/ladder/gate, no cut point ("drop" omits from the summary only),
+// branch-shaped focus appended to the summarizer instructions, [branch] toast tag.
 import type { CompactionResult, SessionEntry, generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 import { estimateTokens, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import type { DecisionClient } from "./client.ts";
@@ -18,6 +20,16 @@ type SummaryUsage = Awaited<ReturnType<typeof generateSummaryWithUsage>>["usage"
 /** Standing scoping line appended to every summary request (SPEC §6.2). */
 export const SCOPING_LINE =
 	"Summarize only the messages above; the rest of the region is preserved verbatim alongside this summary.";
+
+/**
+ * Branch-shaped focus (SPEC §9): the consumer is the new branch's context, so lean toward
+ * pi's native branch format with the section list stated explicitly. Appended as focus text
+ * (pi slots it under "Additional focus") — never a replaceInstructions-style prompt swap.
+ */
+export const BRANCH_FOCUS =
+	"This summary records the branch being navigated away from, and its consumer is the new branch's context: " +
+	"lean toward pi's native branch summary format with exactly these sections — " +
+	"Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps.";
 
 export interface SummaryCall {
 	text: string;
@@ -52,17 +64,20 @@ export interface LiveFileOps {
 }
 
 export interface LiveRegion {
-	/** messagesToSummarize ∪ turnPrefixMessages as one union (SPEC §6.7). */
+	/** messagesToSummarize ∪ turnPrefixMessages as one union (SPEC §6.7); branch: the abandoned branch's message entries (§9). */
 	messages: Array<Record<string, unknown>>;
 	previousSummary?: string;
 	fileOps: LiveFileOps;
 	tokensBefore: number;
-	/** Estimated tokens of the entries pi keeps outside the compaction entry (§6.6 context delta). */
+	/** Estimated tokens of the entries pi keeps outside the summary (§6.6 context delta); branch has no cut point → 0. */
 	keptRegionTokens: number;
 	reserveTokens: number;
-	firstKeptEntryId: string;
+	/** pi's cut — compaction only; branch summaries move no cut and omit the field. */
+	firstKeptEntryId?: string;
 	customInstructions?: string;
 	signal?: AbortSignal;
+	/** "compact" (session_before_compact) or "branch" (session_before_tree) — one pipeline, tagged tails (SPEC §9). */
+	kind: "compact" | "branch";
 }
 
 export interface LiveCompaction {
@@ -236,19 +251,22 @@ export async function runLive(deps: LiveDeps, opts: LiveOpts, profile: BackendPr
 	const outcome = await decideRegion(deps, opts, profile, {
 		messages: region.messages,
 		previousSummary: region.previousSummary,
-		kind: "compact",
+		kind: region.kind,
 		signal: region.signal,
 	});
 	if ("empty" in outcome) return { outcome: "skipped", compaction: undefined };
 
-	const record = emptyRecord("live", "compact", opts.backend, outcome.ok ? outcome.core.model : outcome.model, outcome.ok ? outcome.core.stage : outcome.stage);
+	// Toasts and records carry the [branch] tag on tree navigation (SPEC §9) — shadow already
+	// formats its own via pipeline.branchTag.
+	const tag = region.kind === "branch" ? " [branch]" : "";
+	const record = emptyRecord("live", region.kind, opts.backend, outcome.ok ? outcome.core.model : outcome.model, outcome.ok ? outcome.core.stage : outcome.stage);
 	if (!outcome.ok) {
 		record.fallback = { rung: outcome.rung, error: outcome.error };
 		record.latencyMs.decision = outcome.decisionMs;
 		deps.writeTelemetry(record);
 		return {
 			outcome: "fallback",
-			toast: `smart-compact: fell back to native (rung ${outcome.rung}: ${outcome.error})`,
+			toast: `smart-compact${tag}: fell back to native (rung ${outcome.rung}: ${outcome.error})`,
 			compaction: undefined,
 		};
 	}
@@ -269,7 +287,10 @@ export async function runLive(deps: LiveDeps, opts: LiveOpts, profile: BackendPr
 		try {
 			// Privacy (SPEC §10): the summarizer defaults to the session model — a remote LLM — so
 			// its input is egress like the decision request (policy: privacy.ts, redactUnlessFull).
-			const instructions = [region.customInstructions, SCOPING_LINE].filter(Boolean).join("\n\n");
+			// Branch runs append BRANCH_FOCUS as focus text (§9) — never a prompt swap.
+			const instructions = [region.customInstructions, region.kind === "branch" ? BRANCH_FOCUS : undefined, SCOPING_LINE]
+				.filter(Boolean)
+				.join("\n\n");
 			const r = await deps.summarize(redactUnlessFull(opts.privacy, summarizeMsgs), {
 				customInstructions: instructions,
 				reserveTokens: region.reserveTokens,
@@ -308,20 +329,20 @@ export async function runLive(deps: LiveDeps, opts: LiveOpts, profile: BackendPr
 		deps.writeTelemetry(record);
 		return {
 			outcome: "fallback",
-			toast: `smart-compact: fell back to native (reduction ${reductionPct}% below minReductionPct ${opts.minReductionPct}%)`,
+			toast: `smart-compact${tag}: fell back to native (reduction ${reductionPct}% below minReductionPct ${opts.minReductionPct}%)`,
 			compaction: undefined,
 		};
 	}
 
 	deps.writeTelemetry(record);
 	const sign = reductionPct >= 0 ? "−" : "+";
-	const toast = `smart-compact: kept ${classCounts.keep} · summarized ${classCounts.summarize} · dropped ${classCounts.drop} — ${fmtTok(region.tokensBefore)} → ${fmtTok(after)} tok (${sign}${Math.abs(reductionPct)}%)`;
+	const toast = `smart-compact${tag}: kept ${classCounts.keep} · summarized ${classCounts.summarize} · dropped ${classCounts.drop} — ${fmtTok(region.tokensBefore)} → ${fmtTok(after)} tok (${sign}${Math.abs(reductionPct)}%)`;
 	return {
 		outcome: "compacted",
 		toast,
 		compaction: {
 			summary: composed,
-			firstKeptEntryId: region.firstKeptEntryId,
+			firstKeptEntryId: region.firstKeptEntryId ?? "", // branch runs move no cut — never surfaced (§9)
 			tokensBefore: region.tokensBefore,
 			estimatedTokensAfter: after,
 			usage,

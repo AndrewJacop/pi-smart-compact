@@ -3,13 +3,14 @@
 // one returns undefined = native pi compaction/branch summary: the extension is
 // never worse than native. Shadow mode = decisions only; live mode = decision-driven
 // composition via the targeted summarizer + composer + reduction gate (ticket 04).
-import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeTreeEvent } from "@earendil-works/pi-coding-agent";
-import { generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeTreeEvent, SessionBeforeTreeResult } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, generateSummaryWithUsage, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
 import { clefClient, type DecisionClient } from "./client.ts";
 import { effectiveProfile, isObject, missingBackendKey, validateSmartCompact } from "./config.ts";
-import { keptRegionTokens, clampKeptRegion, runLive, type SummarizerFn } from "./live.ts";
+import { keptRegionTokens, clampKeptRegion, runLive, type LiveFileOps, type LiveResult, type SummarizerFn } from "./live.ts";
 import { loadQuestionSet, runShadow } from "./pipeline.ts";
 import { appendTelemetry, telemetryDir } from "./telemetry.ts";
+import { estimateTextTokens } from "./units.ts";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
@@ -40,6 +41,42 @@ function defaultMakeSummarizer(ctx: ExtensionContext): SummarizerFn {
 	};
 }
 
+/** pi's branchSummary.reserveTokens default (settings-manager) — the branch summarizer's reserve. */
+const BRANCH_RESERVE_TOKENS = 16384;
+
+/**
+ * Branch region (SPEC §9, native parity): the abandoned branch's message entries verbatim;
+ * prior compaction and branch-summary entries become user-role text units — already-distilled
+ * summaries the matrix pins keep (§4), so they ride the composed doc like native's do (§1: never
+ * worse than native). Custom messages pass in pi's own shape (pinned unknown → keep). Shadow
+ * and live share this one source.
+ */
+function branchRegionMessages(event: SessionBeforeTreeEvent): Array<Record<string, unknown>> {
+	return event.preparation.entriesToSummarize.flatMap((e): Array<Record<string, unknown>> => {
+		switch (e.type) {
+			case "message":
+				// SAFETY: pi messages are plain JSON objects from the session file — the pipeline's
+				// structural reads (role/content) are exactly what entry.message carries.
+				return [e.message as unknown as Record<string, unknown>];
+			case "compaction":
+			case "branch_summary":
+				// ≙ pi's createCompactionSummaryMessage/createBranchSummaryMessage (unexported),
+				// normalized to user-role text both the pipeline and the summarizer render.
+				return [{ role: "user", content: [{ type: "text", text: e.summary }], timestamp: e.timestamp }];
+			case "custom_message":
+				// ≙ pi's createCustomMessage (unexported); pinned keep (unknown unit), never summarized.
+				return [{ role: "custom", customType: e.customType, content: e.content, display: e.display, details: e.details, timestamp: e.timestamp }];
+			default:
+				return [];
+		}
+	});
+}
+
+/** pi's native branch file ops over the whole span (incl. cumulative branch_summary details) — FileOperations ≡ LiveFileOps. */
+function branchFileOps(event: SessionBeforeTreeEvent): LiveFileOps {
+	return prepareBranchEntries(event.preparation.entriesToSummarize, 0).fileOps;
+}
+
 export default function smartCompact(pi: ExtensionAPI) {
 	// Warn-once-per-session state; a new session starts with a clean slate.
 	const warned = new Set<string>();
@@ -68,7 +105,7 @@ export async function run(
 	kind: Kind,
 	makeClient: (profile: { endpoint: string }, decisionTimeoutMs: number) => DecisionClient = defaultMakeClient,
 	makeSummarizer: (ctx: ExtensionContext) => SummarizerFn = defaultMakeSummarizer,
-): Promise<SessionBeforeCompactResult | undefined> {
+): Promise<SessionBeforeCompactResult | SessionBeforeTreeResult | undefined> {
 	const raw = (pi.getSettings() as Record<string, unknown>).smartCompact;
 
 	// mode "off" is inert before anything else: no decision call, no toasts, no records.
@@ -125,8 +162,46 @@ export async function run(
 	};
 
 	if (cfg.mode === "live") {
-		// Branch summaries route through the same pipeline in ticket 07; until then native (fail-open, silent).
-		if (kind === "branch") return undefined;
+		const liveOpts = { backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct, privacy: cfg.privacy };
+		const notifyLive = (live: LiveResult) => {
+			if (live.toast) ctx.ui.notify(live.toast, live.outcome === "compacted" ? "info" : "warning");
+		};
+		if (kind === "branch") {
+			// Branch summaries route through the SAME pipeline (ticket 07, SPEC §9): same matrix,
+			// ladder, repair, composer, gate — only the region source, the gate's delta (no cut
+			// point: "drop" omits from the summary only, the branch stays navigable), and the
+			// result mapping differs. keptMessages stays compact-only: with no cut point, an exempt
+			// tail would be silently lost from the summary. {cancel} is never returned from this hook.
+			const evt = event as SessionBeforeTreeEvent;
+			const prep = evt.preparation;
+			const live = await runLive(
+				{ ...decisionDeps, summarize: makeSummarizer(ctx) },
+				liveOpts,
+				profile,
+				{
+					messages: branchRegionMessages(evt),
+					previousSummary: undefined,
+					fileOps: branchFileOps(evt),
+					// Gate "before": pi's estimator over the region's entries (tree events carry no
+					// tokensBefore); prior summaries count via the same chars/4 formula. Custom-message
+					// entries (rare) are skipped — makes the gate marginally stricter, never looser.
+					tokensBefore: prep.entriesToSummarize.reduce((s, e) => {
+						if (e.type === "message") return s + estimateTokens(e.message);
+						if (e.type === "compaction" || e.type === "branch_summary") return s + estimateTextTokens(e.summary);
+						return s;
+					}, 0),
+					keptRegionTokens: 0,
+					reserveTokens: (pi.getSettings() as { branchSummary?: { reserveTokens?: number } }).branchSummary?.reserveTokens ?? BRANCH_RESERVE_TOKENS,
+					customInstructions: prep.customInstructions,
+					signal: evt.signal,
+					kind: "branch",
+				},
+			);
+			notifyLive(live);
+			if (!live.compaction) return undefined;
+			const { summary, details, usage } = live.compaction;
+			return { summary: { summary, details, usage }, label: "smart-compact" };
+		}
 		const evt = event as SessionBeforeCompactEvent;
 		const prep = evt.preparation;
 		// The clamp result when the knob is unset/inactive: pi's cut verbatim, nothing exempt.
@@ -138,7 +213,7 @@ export async function run(
 		const span = [...prep.messagesToSummarize, ...prep.turnPrefixMessages] as Array<Record<string, unknown>>;
 		const live = await runLive(
 			{ ...decisionDeps, summarize: makeSummarizer(ctx) },
-			{ backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct, privacy: cfg.privacy },
+			liveOpts,
 			profile,
 			{
 				// Region for decision and summary: messagesToSummarize ∪ split-turn prefix (SPEC §6.7),
@@ -153,18 +228,19 @@ export async function run(
 				firstKeptEntryId: kept.firstKeptEntryId,
 				customInstructions: evt.customInstructions,
 				signal: evt.signal,
+				kind: "compact",
 			},
 		);
-		if (live.toast) ctx.ui.notify(live.toast, live.outcome === "compacted" ? "info" : "warning");
+		notifyLive(live);
 		// LiveCompaction is a pi CompactionResult (details is the generic param; usage is pi's Usage).
 		return live.compaction ? { compaction: live.compaction } : undefined;
 	}
 
-	// Region: messagesToSummarize for compactions; message entries for branch summaries (SPEC §9).
+	// Region: the shared branch source for tree navigation; messagesToSummarize for compactions (SPEC §9).
 	const messagesSource =
 		kind === "compact"
 			? (event as SessionBeforeCompactEvent).preparation.messagesToSummarize
-			: (event as SessionBeforeTreeEvent).preparation.entriesToSummarize.flatMap((e) => (e.type === "message" ? [e.message] : []));
+			: branchRegionMessages(event as SessionBeforeTreeEvent);
 	// Shadow is live's counterfactual (§8.1), so it exempts the same tail (SPEC §3.2) —
 	// but never cancels: shadow cannot move pi's cut, so the config edge stays live-only.
 	const shadowExempt =

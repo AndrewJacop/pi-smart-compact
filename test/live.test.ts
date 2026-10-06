@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -9,21 +8,11 @@ import { DEFAULT_MATRIX, effectiveProfile } from "../extensions/smart-compact/co
 import { keptRegionTokens, runLive, type LiveDeps, type LiveRegion } from "../extensions/smart-compact/live.ts";
 import { loadQuestionSet } from "../extensions/smart-compact/pipeline.ts";
 import { estimateTextTokens } from "../extensions/smart-compact/units.ts";
-import { assistant, toolResult, user } from "./helpers.ts";
+import { assistant, toolResult, user, stubMakeClient, stubMakeSummarizer, SUMMARY_USAGE, useKey, restoreKey, withAgentDir, type Capture } from "./helpers.ts";
 
 const DEFAULT_QUESTIONS = fileURLToPath(new URL("../extensions/smart-compact/questions.default.json", import.meta.url));
 const OPTS = (minReductionPct = 50) => ({ backend: "clef", matrix: DEFAULT_MATRIX, minReductionPct });
 const PROFILE = effectiveProfile("clef", undefined);
-
-/** pi's full Usage shape — the summarizer stub returns it verbatim. */
-const SUMMARY_USAGE = {
-	input: 111,
-	output: 22,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 133,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 
 // Answers classifying the standard fixture: think drop, text summarize, call keep, result drop
 // (the repair's surviving orphan shape: a kept call whose result was dropped, SPEC §6.4).
@@ -44,11 +33,6 @@ function fixtureMessages() {
 		]),
 		toolResult("c1", "read", `// src/store.ts dump\n${"x".repeat(5000)}`),
 	];
-}
-
-interface Capture {
-	requests?: DecisionRequest[];
-	summarizeCalls: { msgs: unknown[]; opts: unknown }[];
 }
 
 function liveDeps(
@@ -85,6 +69,7 @@ function liveRegion(over: Partial<LiveRegion> = {}): LiveRegion {
 		keptRegionTokens: 500,
 		reserveTokens: 16384,
 		firstKeptEntryId: "entry-keep",
+		kind: "compact",
 		...over,
 	};
 }
@@ -386,65 +371,4 @@ test("shell live mode: persisted compaction result + info toast; telemetry with 
 	}
 });
 
-test("shell live mode branch: native until ticket 07 (silent, no decision call)", async () => {
-	useKey();
-	try {
-		const calls: unknown[][] = [];
-		const ctx = { ui: { notify: (...args: unknown[]) => calls.push(args) } } as unknown as ExtensionContext;
-		const pi = { getSettings: () => ({ smartCompact: { mode: "live" } }) } as unknown as ExtensionAPI;
-		const evt = {
-			type: "session_before_tree",
-			preparation: { userWantsSummary: true, entriesToSummarize: [{ type: "message", message: user("branch work") }] },
-			signal: new AbortController().signal,
-		};
-		const capture: Capture = { summarizeCalls: [] };
-		const result = await run(pi, ctx, new Set<string>(), evt as never, "branch", stubMakeClient({}, capture), stubMakeSummarizer(capture));
-		assert.equal(result, undefined);
-		assert.equal(capture.requests!.length, 0, "no decision call");
-		assert.equal(capture.summarizeCalls.length, 0);
-		assert.equal(calls.length, 0, "no toast");
-	} finally {
-		restoreKey();
-	}
-});
-
-import { mkdtempSync as mkd } from "node:fs";
-const ENV_KEY = "OPTOLLM_API_KEY";
-let savedKey: string | undefined;
-
-function useKey(): void {
-	savedKey = process.env[ENV_KEY];
-	process.env[ENV_KEY] = "sk-test";
-}
-
-function restoreKey(): void {
-	if (savedKey === undefined) delete process.env[ENV_KEY];
-	else process.env[ENV_KEY] = savedKey;
-}
-
-async function withAgentDir(mutate: (dir: string) => void | Promise<void>): Promise<void> {
-	const dir = mkd(join(tmpdir(), "sc-live-"));
-	process.env.PI_CODING_AGENT_DIR = dir;
-	try {
-		await mutate(dir);
-	} finally {
-		delete process.env.PI_CODING_AGENT_DIR;
-	}
-}
-
-function stubMakeClient(answers: unknown, capture: Capture) {
-	capture.requests = [];
-	return (_profile: { endpoint: string }, _timeoutMs: number) => ({
-		async decide(req: DecisionRequest): Promise<DecisionBatch> {
-			capture.requests!.push(req);
-			return { ok: true, answers: answers as Record<string, never>, model: "clef", inputTokens: 321 };
-		},
-	});
-}
-
-function stubMakeSummarizer(capture: Capture) {
-	return (_ctx: ExtensionContext) => async (msgs: unknown[], opts: unknown) => {
-		capture.summarizeCalls.push({ msgs: [...msgs], opts });
-		return { text: "## Goal\nbuild the limiter", usage: SUMMARY_USAGE };
-	};
-}
+// Live-mode branch summaries are covered by test/branch.test.ts (ticket 07).

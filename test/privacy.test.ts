@@ -174,6 +174,7 @@ function liveRegion(over: Partial<LiveRegion> = {}): LiveRegion {
 		keptRegionTokens: 0,
 		reserveTokens: 16384,
 		firstKeptEntryId: "entry-keep",
+		kind: "compact",
 		...over,
 	};
 }
