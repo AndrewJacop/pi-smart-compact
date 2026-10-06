@@ -5,7 +5,7 @@
 // The reduction gate (rung 4) guards the context delta; summarizer failure → native
 // (rung 3, no salvage, no retry). Branch summaries join the pipeline in ticket 07.
 import type { CompactionResult, SessionEntry, generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
-import { estimateTokens } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import type { DecisionClient } from "./client.ts";
 import type { Action, BackendProfile, Privacy, UnitType } from "./config.ts";
 import { redactUnlessFull } from "./privacy.ts";
@@ -140,6 +140,58 @@ export function keptRegionTokens(entries: SessionEntry[], firstKeptEntryId: stri
 		if (e.type === "message") tokens += estimateTokens(e.message);
 	}
 	return tokens;
+}
+
+// ---------- kept-region clamp (SPEC §7, keptMessages: N) ----------
+
+export type KeptClamp = { cancel: false; firstKeptEntryId: string; exemptCount: number } | { cancel: true };
+
+/**
+ * Context messages an entry contributes to the summarized span — pi's
+ * getMessagesFromProjectedEntryForCompaction rules (sessionEntryToContextMessages minus
+ * system replay; compaction entries are the boundary, never span).
+ */
+// ponytail: counts raw entries, not pi's context_edit-aware projection — v1 has no edit
+// path; if kept-region omissions (v2) land, re-derive via buildSessionProjection.
+function spanMessageCount(entry: SessionEntry): number {
+	if (entry.type === "compaction") return 0;
+	return sessionEntryToContextMessages(entry).filter((m) => m.role !== "system").length;
+}
+
+/**
+ * Clamp pi's cut so the newest `keptMessages` messages stay verbatim: effective cut =
+ * min(pi's cut, Nth-newest-message boundary) — cut-earlier-only, we only ever keep MORE
+ * than pi chose. Returns the clamped cut id, how many span messages the clamp now keeps
+ * (exempt from every decision — the region array's tail), or cancel when the clamp
+ * empties the summarizable span (N ≥ session length; the one documented cancel, §7).
+ * Unknown pi id → verbatim + nothing exempt (pi degenerates to keep-everything, safe).
+ */
+export function clampKeptRegion(entries: SessionEntry[], firstKeptEntryId: string, keptMessages: number | undefined): KeptClamp {
+	if (!keptMessages) return { cancel: false, firstKeptEntryId, exemptCount: 0 }; // unset = pi default; 0 = no-op, never "retain none"
+	const piCut = entries.findIndex((e) => e.id === firstKeptEntryId);
+	if (piCut < 0) return { cancel: false, firstKeptEntryId, exemptCount: 0 };
+
+	// Nth-newest-message boundary: walk backwards counting context messages.
+	let b = entries.length - 1;
+	for (let seen = 0; b >= 0 && seen < keptMessages; b--) seen += spanMessageCount(entries[b]);
+	b++; // the loop leaves b one step past the boundary entry
+	// Cut validity: never land on a toolResult — results always keep their call; step earlier.
+	while (b >= 0 && entries[b].type === "message" && (entries[b] as { message: { role: string } }).message.role === "toolResult") b--;
+	if (b < 0) return { cancel: true };
+	const cut = Math.min(piCut, b);
+
+	// The one documented cancel (§7): the clamp emptied the summarizable span
+	// (lastCompaction, cut) — nothing legal to summarize, a no-op entry would churn.
+	let lastCompaction = -1;
+	for (let i = 0; i < piCut; i++) if (entries[i].type === "compaction") lastCompaction = i;
+	let spanMsgs = 0;
+	for (let i = lastCompaction + 1; i < cut; i++) spanMsgs += spanMessageCount(entries[i]);
+	if (spanMsgs === 0) return { cancel: true };
+
+	// Exempt = the span messages the clamped cut retains = the region array's tail.
+	let exemptCount = 0;
+	for (let i = cut; i < piCut; i++) exemptCount += spanMessageCount(entries[i]);
+	return { cancel: false, firstKeptEntryId: entries[cut].id, exemptCount };
 }
 
 function fmtTok(n: number): string {

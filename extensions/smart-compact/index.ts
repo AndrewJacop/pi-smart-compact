@@ -7,7 +7,7 @@ import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, Session
 import { generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 import { clefClient, type DecisionClient } from "./client.ts";
 import { effectiveProfile, isObject, missingBackendKey, validateSmartCompact } from "./config.ts";
-import { keptRegionTokens, runLive, type SummarizerFn } from "./live.ts";
+import { keptRegionTokens, clampKeptRegion, runLive, type KeptClamp, type SummarizerFn } from "./live.ts";
 import { loadQuestionSet, runShadow } from "./pipeline.ts";
 import { appendTelemetry, telemetryDir } from "./telemetry.ts";
 import { fileURLToPath } from "node:url";
@@ -85,6 +85,22 @@ export async function run(
 	}
 	const cfg = v.config;
 
+	// Kept-region clamp (SPEC §7): live-mode cut movement only — shadow/off return native
+	// and cannot move pi's cut. Runs BEFORE rung 0: N ≥ session length is a config edge,
+	// the one documented cancel (manual throws "Compaction cancelled", auto returns false).
+	let clamp: KeptClamp = { cancel: false, firstKeptEntryId: (event as SessionBeforeCompactEvent).preparation.firstKeptEntryId, exemptCount: 0 };
+	if (cfg.mode === "live" && kind === "compact" && cfg.keptMessages) {
+		const evt = event as SessionBeforeCompactEvent;
+		clamp = clampKeptRegion(evt.branchEntries, evt.preparation.firstKeptEntryId, cfg.keptMessages);
+		if (clamp.cancel) {
+			ctx.ui.notify(
+				`smart-compact: keptMessages ${cfg.keptMessages} exempts every summarizable message — compaction cancelled. Size N so summary + kept region fit under the trigger threshold.`,
+				"warning",
+			);
+			return { cancel: true };
+		}
+	}
+
 	// Rung 0 (SPEC §8): no backend key. Checked live every run so the smart path
 	// resumes automatically once the key appears; warn once per session.
 	const missing = missingBackendKey(cfg.backend);
@@ -114,19 +130,24 @@ export async function run(
 		if (kind === "branch") return undefined;
 		const evt = event as SessionBeforeCompactEvent;
 		const prep = evt.preparation;
+		// Exempt = the span messages the clamped cut retains (SPEC §3.2): sliced off before
+		// splitting, they are never asked, never summarized, and stay verbatim via the cut.
+		const span = [...prep.messagesToSummarize, ...prep.turnPrefixMessages] as Array<Record<string, unknown>>;
 		const live = await runLive(
 			{ ...decisionDeps, summarize: makeSummarizer(ctx) },
 			{ backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct, privacy: cfg.privacy },
 			profile,
 			{
-				// Region for decision and summary: messagesToSummarize ∪ split-turn prefix (SPEC §6.7).
-				messages: [...prep.messagesToSummarize, ...prep.turnPrefixMessages] as Array<Record<string, unknown>>,
+				// Region for decision and summary: messagesToSummarize ∪ split-turn prefix (SPEC §6.7),
+				// minus the kept-region exemption tail.
+				messages: span.slice(0, Math.max(0, span.length - clamp.exemptCount)),
 				previousSummary: prep.previousSummary,
 				fileOps: prep.fileOps,
 				tokensBefore: prep.tokensBefore,
-				keptRegionTokens: keptRegionTokens(evt.branchEntries, prep.firstKeptEntryId),
+				// The gate reads the REAL kept region — the clamped one (§6.6 context delta).
+				keptRegionTokens: keptRegionTokens(evt.branchEntries, clamp.firstKeptEntryId),
 				reserveTokens: prep.settings.reserveTokens,
-				firstKeptEntryId: prep.firstKeptEntryId,
+				firstKeptEntryId: clamp.firstKeptEntryId,
 				customInstructions: evt.customInstructions,
 				signal: evt.signal,
 			},
