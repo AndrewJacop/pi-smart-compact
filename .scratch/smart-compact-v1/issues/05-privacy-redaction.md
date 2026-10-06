@@ -4,10 +4,10 @@
 
 **Blocked by:** 02 — Decision pipeline in shadow mode; 04 — Live mode: targeted summarizer + composed document + reduction gate (both egress channels must exist).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Default (`redacted`): a seeded secret in a tool result reaches neither the decision state nor the summary request — both show `[REDACTED]`
-- [ ] Each pattern class (API keys, bearer headers, AWS keys, credential env assignments, PEM blocks) is caught on both channels
-- [ ] `privacy:"full"` sends verbatim text on both channels
-- [ ] Idempotency-key content hashes are computed after redaction (same content, same hash, redacted or not)
-- [ ] `privacy` never changes decisions' available actions or the matrix
+- [x] Default (`redacted`): a seeded secret in a tool result reaches neither the decision state nor the summary request — both show `[REDACTED]`
+- [x] Each pattern class (API keys, bearer headers, AWS keys, credential env assignments, PEM blocks) is caught on both channels
+- [x] `privacy:"full"` sends verbatim text on both channels
+- [x] Idempotency-key content hashes are computed after redaction (same content, same hash, redacted or not) — structurally: redaction runs once inside `decideRegion` before any client sees the request, and is deterministic (tested); ticket 08 derives the actual hash from the already-redacted request
+- [x] `privacy` never changes decisions' available actions or the matrix
