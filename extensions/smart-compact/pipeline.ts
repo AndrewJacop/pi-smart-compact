@@ -1,8 +1,8 @@
-// The decision pipeline in shadow mode (SPEC §3, §8.1; v1 tickets 02+03):
-// split → partition (pinned vs askable) → state-fitting ladder → chunked
-// concurrent decide → map (argmax∩subset + confidence floor) → repair
-// (call := min(call, result)). Shadow runs decisions only, records telemetry +
-// the [shadow] toast, and always returns native (compaction: undefined).
+// The decision pipeline (SPEC §3; v1 tickets 02–04): split → partition (pinned vs
+// askable) → state-fitting ladder → chunked concurrent decide → map (argmax∩subset
+// + confidence floor) → repair (call := min(call, result)). `decideRegion` is the
+// shared core; shadow mode (decisions only, [shadow] toast, always native) and live
+// mode (ticket 04's summarizer + composer + gate) both consume it.
 import { readFileSync } from "node:fs";
 import type { DecisionBatch, DecisionClient, DecisionQuestion } from "./client.ts";
 import type { Action, BackendProfile, UnitType } from "./config.ts";
@@ -305,9 +305,8 @@ export interface TelemetryRecord {
 	usage: { decisionInputTokens: number; summaryInputTokens: number; summaryOutputTokens: number };
 }
 
-export interface ShadowOpts {
+export interface DecisionOpts {
 	backend: string;
-	decisionTimeoutMs: number;
 	matrix: Record<UnitType, Action[]>;
 }
 
@@ -332,27 +331,14 @@ export interface ShadowResult {
 }
 
 const PAST: Record<Action, string> = { keep: "kept", summarize: "summarized", drop: "dropped" };
-const RANK: Record<Action, number> = { keep: 0, summarize: 1, drop: 2 }; // destructiveness (SPEC §3.6)
 
-// ponytail: shadow's −N% assumes the summarize class compresses 10× plus 200 tok of doc
-// overhead — a placeholder until ticket 04's composer gives the real number.
-const SUMMARY_ASSUMPTION = 10;
-const DOC_OVERHEAD_TOKENS = 200;
-
-function confStr(c: number): string {
-	return String(Math.round(c * 100) / 100);
-}
-
-export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: BackendProfile | null, region: ShadowRegion): Promise<ShadowResult> {
-	const units = splitUnits(region.messages, region.previousSummary);
-	if (units.length === 0) return { outcome: "skipped", compaction: undefined };
-
-	const t0 = Date.now();
-	const mkRecord = (model: string, stage: string): TelemetryRecord => ({
+/** An empty telemetry record; both mode tails fill what they know and write it. */
+export function emptyRecord(mode: TelemetryRecord["mode"], kind: TelemetryRecord["kind"], backend: string, model: string, stage: string): TelemetryRecord {
+	return {
 		ts: new Date().toISOString(),
-		kind: region.kind,
-		mode: "shadow",
-		backend: opts.backend,
+		kind,
+		mode,
+		backend,
 		model,
 		stage,
 		units: [],
@@ -361,16 +347,55 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		reductionPct: null,
 		latencyMs: { decision: 0, summary: 0 },
 		usage: { decisionInputTokens: 0, summaryInputTokens: 0, summaryOutputTokens: 0 },
-	});
-	const finishFallback = (record: TelemetryRecord, rung: 1 | 2, error: string): ShadowResult => {
-		record.fallback = { rung, error };
-		record.latencyMs.decision = Date.now() - t0;
-		deps.writeTelemetry(record);
-		return { outcome: "fallback", toast: `smart-compact [shadow]${branchTag(region.kind)}: decision pipeline failed (rung ${rung}: ${error}) — native ran`, compaction: undefined };
 	};
+}
+const RANK: Record<Action, number> = { keep: 0, summarize: 1, drop: 2 }; // destructiveness (SPEC §3.6)
+
+function confStr(c: number): string {
+	return String(Math.round(c * 100) / 100);
+}
+
+// ---------- decision core (shared by shadow + live) ----------
+
+export interface DecisionCore {
+	units: Unit[];
+	/** Per-unit decisions incl. pinned policy + salvage, by unit id. */
+	actions: Map<string, UnitRecord>;
+	all: UnitRecord[];
+	classCounts: Record<Action, number>;
+	stage: LadderStage | "n/a";
+	model: string;
+	decisionMs: number;
+	inputTokens: number;
+	/** Serialized-region token estimate (the "before" of the token tallies). */
+	regionTokens: number;
+	/** Serialized tokens per action class (shadow's counterfactual estimate uses these). */
+	tokensByAction: Record<Action, number>;
+}
+
+export type DecisionOutcome =
+	| { ok: true; core: DecisionCore }
+	| { ok: false; empty: true }
+	| { ok: false; rung: 1 | 2; error: string; model: string; stage: LadderStage | "n/a"; decisionMs: number };
+
+/**
+ * The full decision pipeline over one region — everything the modes share, through
+ * the pairing repair and the token tally. No telemetry, no toast: tails own those.
+ */
+export async function decideRegion(
+	deps: { client: DecisionClient; questionSet: QuestionSet },
+	opts: DecisionOpts,
+	profile: BackendProfile | null,
+	region: ShadowRegion,
+): Promise<DecisionOutcome> {
+	const units = splitUnits(region.messages, region.previousSummary);
+	if (units.length === 0) return { ok: false, empty: true };
+
+	const t0 = Date.now();
 
 	// Unwired backend (ticket 08 ships the rest): fail open, honestly labeled.
-	if (!profile) return finishFallback(mkRecord("unknown", "n/a"), 1, `backend "${opts.backend}" has no wired profile yet`);
+	if (!profile)
+		return { ok: false, rung: 1, error: `backend "${opts.backend}" has no wired profile yet`, model: "unknown", stage: "n/a", decisionMs: Date.now() - t0 };
 
 	// Partition: length-1 rows (and unknown unit types) are pinned policy, never asked (SPEC §3.3).
 	const actions = new Map<string, UnitRecord>();
@@ -396,11 +421,14 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 	// gates here (ticket-02's crude trim was its placeholder).
 	const fitted = fitState(units, profile.stateTokenBudget);
 	if (!fitted) {
-		return finishFallback(
-			mkRecord(profile.model, LAST_STAGE),
-			1,
-			`state cannot fit budget ${profile.stateTokenBudget} even at the final ladder stage "${LAST_STAGE}"`,
-		);
+		return {
+			ok: false,
+			rung: 1,
+			error: `state cannot fit budget ${profile.stateTokenBudget} even at the final ladder stage "${LAST_STAGE}"`,
+			model: profile.model,
+			stage: LAST_STAGE,
+			decisionMs: Date.now() - t0,
+		};
 	}
 	const { state, stage } = fitted;
 
@@ -427,7 +455,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 	// with every batch; answers merge by question id. Questions too big for what the budget has
 	// left default to keep.
 	const questionBudget = Math.max(0, profile.stateTokenBudget - estimateStateTokens(state));
-	const batches: Unit[][] = [];
+	const batches: Unit[][] = []; // (chunking detail unchanged from ticket 02)
 	let current: Unit[] = [];
 	let currentTokens = 0;
 	for (const u of askable) {
@@ -465,7 +493,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		// Any transport-class failure fails the run to native — no partial salvage across batches.
 		const failed = results.find((r): r is Extract<DecisionBatch, { ok: false }> => !r.ok);
 		if (failed) {
-			return finishFallback(mkRecord(profile.model, stage), failed.error.rung, `${failed.error.kind}: ${failed.error.message}`);
+			return { ok: false, rung: failed.error.rung, error: `${failed.error.kind}: ${failed.error.message}`, model: profile.model, stage, decisionMs };
 		}
 		for (const r of results) {
 			if (!r.ok) continue;
@@ -513,7 +541,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		}
 	}
 	if (questioned.length > 0 && validAnswers === 0) {
-		return finishFallback(mkRecord(profile.model, stage), 2, "no valid answers in response (wholly unusable)");
+		return { ok: false, rung: 2, error: "no valid answers in response (wholly unusable)", model: profile.model, stage, decisionMs };
 	}
 
 	// Pairing repair: call := min(call, result) by destructiveness rank (SPEC §3.6).
@@ -537,30 +565,58 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		}
 	}
 
-	// Telemetry + counterfactual toast; shadow always returns native.
+	// Token tally (serialized-region estimate); tails own telemetry, toasts, and their own "after".
 	const all = units.map((u) => actions.get(u.id)).filter((d): d is UnitRecord => !!d);
 	const classCounts: Record<Action, number> = { keep: 0, summarize: 0, drop: 0 };
 	const unitTokens = (u: Unit) => estimateTextTokens(serializeUnit(u));
-	let before = 0;
+	let regionTokens = 0;
 	const tokensByAction: Record<Action, number> = { keep: 0, summarize: 0, drop: 0 };
 	for (const u of units) {
 		const t = unitTokens(u);
-		before += t;
+		regionTokens += t;
 		const a = actions.get(u.id);
 		if (a) {
 			classCounts[a.action]++;
 			tokensByAction[a.action] += t;
 		}
 	}
+	return {
+		ok: true,
+		core: { units, actions, all, classCounts, stage, model: profile.model, decisionMs, inputTokens, regionTokens, tokensByAction },
+	};
+}
+
+// ---------- shadow tail (SPEC §8.1; decisions only, always native) ----------
+
+export async function runShadow(deps: ShadowDeps, opts: DecisionOpts, profile: BackendProfile | null, region: ShadowRegion): Promise<ShadowResult> {
+	const outcome = await decideRegion(deps, opts, profile, region);
+	if ("empty" in outcome) return { outcome: "skipped", compaction: undefined };
+	if (!outcome.ok) {
+		const record = emptyRecord("shadow", region.kind, opts.backend, outcome.model, outcome.stage);
+		record.fallback = { rung: outcome.rung, error: outcome.error };
+		record.latencyMs.decision = outcome.decisionMs;
+		deps.writeTelemetry(record);
+		return {
+			outcome: "fallback",
+			toast: `smart-compact [shadow]${branchTag(region.kind)}: fell back to native (rung ${outcome.rung}: ${outcome.error})`,
+			compaction: undefined,
+		};
+	}
+	const { classCounts, tokensByAction, regionTokens: before } = outcome.core;
+
+	// ponytail: shadow's −N% assumes the summarize class compresses 10× plus 200 tok of doc
+	// overhead — a placeholder counterfactual; live mode's composer computes the real number.
+	const SUMMARY_ASSUMPTION = 10;
+	const DOC_OVERHEAD_TOKENS = 200;
 	const after = tokensByAction.keep + Math.ceil(tokensByAction.summarize / SUMMARY_ASSUMPTION) + DOC_OVERHEAD_TOKENS;
 	const reductionPct = before > 0 ? Math.max(0, Math.round((1 - after / before) * 1000) / 10) : 0;
 
-	const record = mkRecord(profile.model, stage);
-	record.units = all;
+	const record = emptyRecord("shadow", region.kind, opts.backend, outcome.core.model, outcome.core.stage);
+	record.units = outcome.core.all;
 	record.classCounts = classCounts;
 	record.reductionPct = reductionPct;
-	record.latencyMs.decision = decisionMs;
-	record.usage.decisionInputTokens = inputTokens;
+	record.latencyMs.decision = outcome.core.decisionMs;
+	record.usage.decisionInputTokens = outcome.core.inputTokens;
 	deps.writeTelemetry(record);
 
 	const toast = `smart-compact [shadow]${branchTag(region.kind)}: would keep ${classCounts.keep} · summarize ${classCounts.summarize} · drop ${classCounts.drop} (−${reductionPct}%) — native ran`;

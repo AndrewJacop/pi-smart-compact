@@ -1,10 +1,13 @@
-// @andrewjacop/pi-smart-compact — fail-open shell (SPEC §2, §8; v1 tickets 01+02).
+// @andrewjacop/pi-smart-compact — fail-open shell (SPEC §2, §8; v1 tickets 01+02+04).
 // Registers session_before_compact + session_before_tree. Every path but the smart
 // one returns undefined = native pi compaction/branch summary: the extension is
-// never worse than native. Ticket 02 wires the decision pipeline in shadow mode.
-import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, SessionBeforeTreeEvent } from "@earendil-works/pi-coding-agent";
+// never worse than native. Shadow mode = decisions only; live mode = decision-driven
+// composition via the targeted summarizer + composer + reduction gate (ticket 04).
+import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeTreeEvent } from "@earendil-works/pi-coding-agent";
+import { generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 import { clefClient, type DecisionClient } from "./client.ts";
 import { effectiveProfile, isObject, missingBackendKey, validateSmartCompact } from "./config.ts";
+import { keptRegionTokens, runLive, type SummarizerFn } from "./live.ts";
 import { loadQuestionSet, runShadow } from "./pipeline.ts";
 import { appendTelemetry, telemetryDir } from "./telemetry.ts";
 import { fileURLToPath } from "node:url";
@@ -18,6 +21,23 @@ function overrideQuestionsPath(): string {
 
 function defaultMakeClient(profile: { endpoint: string }, decisionTimeoutMs: number): DecisionClient {
 	return clefClient({ endpoint: profile.endpoint, apiKey: process.env.OPTOLLM_API_KEY ?? "", timeoutMs: decisionTimeoutMs });
+}
+
+/** The default summarizer: pi's own summary-with-usage call, authed off the session model. */
+function defaultMakeSummarizer(ctx: ExtensionContext): SummarizerFn {
+	return async (msgs, opts) => {
+		const model = ctx.model;
+		if (!model) throw new Error("no session model to summarize with");
+		// The summarizer resolves its own auth off the session model (modelRegistry path).
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) throw new Error(auth.error);
+		// No previousSummary param — the composed head owns iteration (SPEC §6.2/§6.3).
+		const headers = auth.headers
+			? (Object.fromEntries(Object.entries(auth.headers).filter((entry): entry is [string, string] => entry[1] !== null)) as Record<string, string>)
+			: undefined;
+		const r = await generateSummaryWithUsage(msgs as never, model, opts.reserveTokens, auth.apiKey, headers, opts.signal, opts.customInstructions);
+		return { text: r.text, usage: r.usage };
+	};
 }
 
 export default function smartCompact(pi: ExtensionAPI) {
@@ -47,7 +67,8 @@ export async function run(
 	event: SessionBeforeCompactEvent | SessionBeforeTreeEvent,
 	kind: Kind,
 	makeClient: (profile: { endpoint: string }, decisionTimeoutMs: number) => DecisionClient = defaultMakeClient,
-): Promise<undefined> {
+	makeSummarizer: (ctx: ExtensionContext) => SummarizerFn = defaultMakeSummarizer,
+): Promise<SessionBeforeCompactResult | undefined> {
 	const raw = (pi.getSettings() as Record<string, unknown>).smartCompact;
 
 	// mode "off" is inert before anything else: no decision call, no toasts, no records.
@@ -72,21 +93,6 @@ export async function run(
 		return undefined;
 	}
 
-	// Ticket 02 ships shadow only; live (summarizer + composer + gate) lands with ticket 04.
-	// The shipped default (mode unset → live) must stay indistinguishable from native (ticket 01):
-	// warn only when the user explicitly asked for live.
-	if (cfg.mode === "live") {
-		if (isObject(raw) && raw.mode === "live") {
-			warnOnce(
-				warned,
-				"live-unshipped",
-				'smart-compact: mode "live" ships in a later ticket — using native compaction. Set mode "shadow" to exercise the decision pipeline.',
-				ctx,
-			);
-		}
-		return undefined;
-	}
-
 	// Question text: bundled defaults + validated global override; malformed → loud, smart off.
 	const q = loadQuestionSet({ defaultPath: DEFAULT_QUESTIONS, overridePath: overrideQuestionsPath() });
 	if (!q.ok) {
@@ -95,6 +101,40 @@ export async function run(
 	}
 
 	const profile = effectiveProfile(cfg.backend, cfg.profiles[cfg.backend]);
+	const decisionDeps = {
+		client: makeClient({ endpoint: profile?.endpoint ?? "" }, cfg.decisionTimeoutMs),
+		writeTelemetry: (record: unknown) => {
+			appendTelemetry(telemetryDir(), record);
+		},
+		questionSet: q.questions,
+	};
+
+	if (cfg.mode === "live") {
+		// Branch summaries route through the same pipeline in ticket 07; until then native (fail-open, silent).
+		if (kind === "branch") return undefined;
+		const evt = event as SessionBeforeCompactEvent;
+		const prep = evt.preparation;
+		const live = await runLive(
+			{ ...decisionDeps, summarize: makeSummarizer(ctx) },
+			{ backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct },
+			profile,
+			{
+				// Region for decision and summary: messagesToSummarize ∪ split-turn prefix (SPEC §6.7).
+				messages: [...prep.messagesToSummarize, ...prep.turnPrefixMessages] as Array<Record<string, unknown>>,
+				previousSummary: prep.previousSummary,
+				fileOps: prep.fileOps,
+				tokensBefore: prep.tokensBefore,
+				keptRegionTokens: keptRegionTokens(evt.branchEntries, prep.firstKeptEntryId),
+				reserveTokens: prep.settings.reserveTokens,
+				firstKeptEntryId: prep.firstKeptEntryId,
+				customInstructions: evt.customInstructions,
+				signal: evt.signal,
+			},
+		);
+		if (live.toast) ctx.ui.notify(live.toast, live.outcome === "compacted" ? "info" : "warning");
+		// LiveCompaction is a pi CompactionResult (details is the generic param; usage is pi's Usage).
+		return live.compaction ? { compaction: live.compaction } : undefined;
+	}
 
 	// Region: messagesToSummarize for compactions; message entries for branch summaries (SPEC §9).
 	const messages =
@@ -104,14 +144,8 @@ export async function run(
 	const previousSummary = kind === "compact" ? (event as SessionBeforeCompactEvent).preparation.previousSummary : undefined;
 
 	const result = await runShadow(
-		{
-			client: makeClient({ endpoint: profile?.endpoint ?? "" }, cfg.decisionTimeoutMs),
-			writeTelemetry: (record) => {
-				appendTelemetry(telemetryDir(), record);
-			},
-			questionSet: q.questions,
-		},
-		{ backend: cfg.backend, decisionTimeoutMs: cfg.decisionTimeoutMs, matrix: cfg.matrix },
+		decisionDeps,
+		{ backend: cfg.backend, matrix: cfg.matrix },
 		profile,
 		{ messages: messages as Array<Record<string, unknown>>, previousSummary, kind, signal: event.signal },
 	);

@@ -21,7 +21,19 @@ function setup(settings: unknown) {
 	return { handlers, ctx };
 }
 
-const compactEvt = { type: "session_before_compact", preparation: {}, signal: new AbortController().signal };
+const compactEvt = {
+	type: "session_before_compact",
+	preparation: {
+		messagesToSummarize: [],
+		turnPrefixMessages: [],
+		fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+		tokensBefore: 0,
+		firstKeptEntryId: "keep-1",
+		settings: { reserveTokens: 16384 },
+	},
+	branchEntries: [],
+	signal: new AbortController().signal,
+};
 const treeEvt = (wants: boolean) => ({ type: "session_before_tree", preparation: { userWantsSummary: wants }, signal: new AbortController().signal });
 
 const ENV_KEY = "OPTOLLM_API_KEY";
@@ -200,17 +212,12 @@ function shadowPi() {
 	return { getSettings: () => ({ smartCompact: { mode: "shadow" } }) } as unknown as ExtensionAPI;
 }
 
-test("mode live is native with a warn-once pointer to shadow (live lands in ticket 04)", async () => {
+test("mode live with empty region: silent native (skip before any LLM use)", async () => {
 	savedKey = process.env[ENV_KEY];
 	process.env[ENV_KEY] = "sk-test";
 	const { handlers, ctx } = setup({ mode: "live" });
-	assert.equal(await handlers.session_before_compact(regionEvt(), ctx), undefined);
-	assert.equal(ctx.calls.length, 1);
-	assert.match(ctx.calls[0].args[0] as string, /"live" ships in a later ticket/);
-	assert.equal(ctx.calls[0].args[1], "warning");
-	// warn-once per session
-	await handlers.session_before_compact(regionEvt(), ctx);
-	assert.equal(ctx.calls.length, 1);
+	assert.equal(await handlers.session_before_compact(compactEvt, ctx), undefined);
+	assert.equal(ctx.calls.length, 0);
 });
 
 test("shadow mode: pipeline runs, toast shows, telemetry record lands, native returned", async () => {

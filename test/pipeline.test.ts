@@ -38,7 +38,7 @@ function profile(overrides: ProfileOverride = {}) {
 	return effectiveProfile("clef", overrides);
 }
 
-const OPTS = { backend: "clef", decisionTimeoutMs: 5000, matrix: DEFAULT_MATRIX };
+const OPTS = { backend: "clef", matrix: DEFAULT_MATRIX };
 // Valid answers for bigRegion's four askable units — {} means "zero valid answers" (rung 2).
 const REGION_ANSWERS = {
 	u_1_text: { type: "choice", choice: "summarize", confidence: 0.9 },
@@ -507,7 +507,7 @@ test("branch kind tags the toast with [branch]", async () => {
 
 test("unwired backend profile → native at rung 1 (only clef ships in ticket 02)", async () => {
 	const collected: unknown[] = [];
-	const result = await runShadow(deps(setupClient({}), collected), { backend: "jev", decisionTimeoutMs: 5000, matrix: DEFAULT_MATRIX }, effectiveProfile("jev", undefined), {
+	const result = await runShadow(deps(setupClient({}), collected), { backend: "jev", matrix: DEFAULT_MATRIX }, effectiveProfile("jev", undefined), {
 		messages: bigRegion(),
 		kind: "compact",
 	});
