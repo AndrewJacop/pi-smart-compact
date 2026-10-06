@@ -4,14 +4,14 @@
 
 **Blocked by:** 02 — Decision pipeline in shadow mode. (For the fixture-sized regions of ticket 09, ticket 03's ladder is also required; this ticket is demoable on smaller regions without it.)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Live compact produces one persisted compaction entry (fromHook) whose document reads in order: verbatim head → LLM section → `## Kept verbatim` → file tags
-- [ ] Only summarize-class units reach the LLM; `/compact [focus]` steers the summary; all-keep region → zero LLM calls
-- [ ] Second compaction keeps the first document's keep-blocks verbatim inside the new head (no prose re-merge)
-- [ ] Dropped result under a kept call shows the one orphan marker; no other drop traces in the document
-- [ ] Entry `details` carry read/modified file lists covering the whole span (incl. dropped reads) + the run record
-- [ ] Split-turn compaction summarizes the union (history + prefix) in one composed doc
-- [ ] Composition missing minReductionPct → native entry, telemetry records rung 4; minReductionPct 0 disables the gate
-- [ ] Summarizer auth failure/timeout → native (rung 3), no retry
-- [ ] Empty classes omit their sections — no placeholders; live toast matches the spec format
+- [x] Live compact produces one persisted compaction entry (fromHook) whose document reads in order: verbatim head → LLM section → `## Kept verbatim` → file tags
+- [x] Only summarize-class units reach the LLM; `/compact [focus]` steers the summary; all-keep region → zero LLM calls
+- [x] Second compaction keeps the first document's keep-blocks verbatim inside the new head (no prose re-merge)
+- [x] Dropped result under a kept call shows the one orphan marker; no other drop traces in the document
+- [x] Entry `details` carry read/modified file lists covering the whole span (incl. dropped reads) + the run record
+- [x] Split-turn compaction summarizes the union (history + prefix) in one composed doc
+- [x] Composition missing minReductionPct → native entry, telemetry records rung 4; minReductionPct 0 disables the gate
+- [x] Summarizer auth failure/timeout → native (rung 3), no retry
+- [x] Empty classes omit their sections — no placeholders; live toast matches the spec format
