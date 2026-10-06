@@ -4,10 +4,10 @@
 
 **Blocked by:** 04 — Live mode: targeted summarizer + composed document + reduction gate.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With `keptMessages: N`, the newest N messages appear verbatim in the composed doc's kept region and were never sent as questions (verifiable in telemetry units)
-- [ ] The clamp only ever keeps MORE than pi's own cut; no message pi would keep gets dropped
-- [ ] Unset knob → byte-identical behavior to ticket 04's live mode
-- [ ] `N=0` → no-op; `N` ≥ session length → compaction cancelled cleanly (manual + auto paths, no entry persisted)
-- [ ] Summary + kept region under the trigger threshold → no re-fire loop on a normal session
+- [x] With `keptMessages: N`, the newest N messages appear verbatim in the composed doc's kept region and were never sent as questions (verifiable in telemetry units) — implemented as SPEC §7's cut-point movement: the clamped `firstKeptEntryId` keeps them verbatim in the live kept region (pi builds context from that id), OUTSIDE the composed doc — §3.2 removes them from decision set and summarizer input, so doc inclusion would duplicate them; exempt ids are absent from `units` in telemetry (live + shadow), never asked
+- [x] The clamp only ever keeps MORE than pi's own cut; no message pi would keep gets dropped — `cut = min(piCut, Nth-newest boundary)`, stepping back over toolResults so results keep their call; window-already-covers-N leaves pi's id verbatim (unit-pinned)
+- [x] Unset knob → byte-identical behavior to ticket 04's live mode — clamp short-circuits to `{cancel:false, pi's id, exemptCount:0}`; `runLive` untouched
+- [x] `N=0` → no-op; `N` ≥ session length → compaction cancelled cleanly (manual + auto paths, no entry persisted) — the cancel precedes rung 0 (fires with or without a key) and returns `{cancel:true}`; pi throws "Compaction cancelled" on manual, returns false on auto, no entry either way (keyed + keyless tested)
+- [x] Summary + kept region under the trigger threshold → no re-fire loop on a normal session — the rung-4 gate now reads `keptRegionTokens(branchEntries, clampedId)`, so an oversized kept region fails the gate to native instead of re-firing (gate pin tested)
