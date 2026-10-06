@@ -4,11 +4,11 @@
 
 **Blocked by:** 04 — Live mode: targeted summarizer + composed document + reduction gate.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Tree navigation with summary requested → branch summary produced by the same pipeline, labeled `smart-compact`, with details file lists
-- [ ] Decline (`userWantsSummary === false`) → instant undefined: no decision call, no shadow log entry, no telemetry record, no toast
-- [ ] Shadow-mode tree navigation → `[shadow][branch]` toast, `kind:"branch"` telemetry record
-- [ ] Dropped units appear in neither the injected summary nor its LLM input, yet the abandoned branch remains fully navigable
-- [ ] Branch summary reads in pi's native branch format with the smart-compact focus appended, not a replaced prompt
-- [ ] Every fallback rung behaves identically to compaction (fail-open to pi's native branch summary)
+- [x] Tree navigation with summary requested → branch summary produced by the same pipeline, labeled `smart-compact`, with details file lists — live branch routes through the SAME `runLive` (kind `"branch"` threads telemetry/focus/toast); result maps to `{summary:{summary,details,usage}, label:"smart-compact"}`; file lists via pi's own `prepareBranchEntries` (cumulative branch_summary details incl.)
+- [x] Decline (`userWantsSummary === false`) → instant undefined: no decision call, no shadow log entry, no telemetry record, no toast — guarded before `run()` (shell test: no calls, no toasts)
+- [x] Shadow-mode tree navigation → `[shadow][branch]` toast, `kind:"branch"` telemetry record — shipped with the shared branch region source (pipeline.test + shell.test)
+- [x] Dropped units appear in neither the injected summary nor its LLM input, yet the abandoned branch remains fully navigable — same `summarizeMessages`/`composeDocument` path; no cut point exists on this hook and `{cancel}` is never returned, so branch entries stay in the session file
+- [x] Branch summary reads in pi's native branch format with the smart-compact focus appended, not a replaced prompt — `BRANCH_FOCUS` (section list stated explicitly) rides the summarizer's `customInstructions` slot (pi appends it as "Additional focus"); `replaceInstructions` untouched; prior compaction/branch_summary entries ride the region as pinned keep units (native parity, §1)
+- [x] Every fallback rung behaves identically to compaction (fail-open to pi's native branch summary) — same `runLive` rungs; rung-1 + rung-4 branch tests assert `undefined` → native
