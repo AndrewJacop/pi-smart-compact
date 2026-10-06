@@ -4,11 +4,11 @@
 
 **Blocked by:** 02 — Decision pipeline in shadow mode.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The ~42k-token spike fixture region makes shadow decisions in one compaction run, with the ladder stage recorded in telemetry
-- [ ] Ladder applies stages in order and only as needed; a small region stays at "full"
-- [ ] Pinned/recent items are never degraded at any stage
-- [ ] A region that can't fit even at the last stage → native compaction, telemetry shows the fallback
-- [ ] More askables than the profile's per-request cap → concurrent batches share the same state, answers merge by question id, no duplicate or lost questions
-- [ ] Units beyond the chunk cap classify keep and say so in their reason strings
+- [x] The ~42k-token spike fixture region makes shadow decisions in one compaction run, with the ladder stage recorded in telemetry
+- [x] Ladder applies stages in order and only as needed; a small region stays at "full"
+- [x] Pinned/recent items are never degraded at any stage
+- [x] A region that can't fit even at the last stage → native compaction, telemetry shows the fallback
+- [x] More askables than the profile's per-request cap → concurrent batches share the same state, answers merge by question id, no duplicate or lost questions
+- [x] Units beyond the chunk cap classify keep and say so in their reason strings
