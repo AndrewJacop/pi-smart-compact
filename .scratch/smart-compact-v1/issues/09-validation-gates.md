@@ -4,10 +4,12 @@
 
 **Blocked by:** 03 — State-fitting ladder + batching; 04 — Live mode: targeted summarizer + composed document + reduction gate; 05 — Privacy redaction; 08 — Remaining backends (gates run per backend).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Reduction gate: ≥ 80% context delta on the fixture per backend, numbers recorded
-- [ ] Sanity gate: wrong-drop = 0 vs ground truth (or human-blessed exceptions noted); keep↔summarize confusion reported; human SANE pass done
-- [ ] Fallback gate: 3/3 injected failures → native, asserted from the persisted session entry (`fromHook: false`, no smart-compact details)
-- [ ] Decision latency p50/p95 recorded per backend
-- [ ] Harness is throwaway: runs from source, ships nothing into the package or repo dev scripts
+- [x] Reduction gate: ≥ 80% context delta on the fixture per backend, numbers recorded — clef **region ratio 98%** (§11's spike-comparable quantity: region ~41.5k → composed ~1.1k) ≥80% **PASS**; §6.6 context delta **63.0%** recorded alongside (65930 → composed ~1.1k + kept ~24.3k — the pi-default kept tail, the 24k-token checklist, is 37% of context and caps this quantity; §11's "context delta" label vs its cited spike numbers (−97.8% is a region ratio) measure different things — ruled per human + §11's own headroom math (97.8−18≈80)); jev/freejev **n/a — test-only backend, never ships** (human ruling); jev-direct skipped (no TYPESAFE_API_KEY), ollama skipped (no local server)
+- [x] Sanity gate: wrong-drop = 0 vs ground truth (or human-blessed exceptions noted); keep↔summarize confusion reported; human SANE pass done — coverage 9/9 ground-truth keys; **wrong-drop = 0**; 1 missed drop **blessed by the human SANE pass** (u_14 passing-test output kept @0.70 — spike precedent "small passing-test output kept — defensible"); 2 keep↔summarize confusions reported, both keep-ward (one via confidence-floor escalation @0.053 — working as designed); human SANE pass **granted**
+- [x] Fallback gate: 3/3 injected failures → native, asserted from the persisted session entry (`fromHook: false`, no smart-compact details) — clef 3/3 (real 401, decisionTimeoutMs 1, injected 500 via NODE_OPTIONS fetch interceptor — setter-trap, pi's bundle reassigns globalThis.fetch) and jev 3/3, all rung 1 → native entry `fromHook:false`/details `{readFiles,modifiedFiles}` only; control run ships `fromHook:true` + `smartCompact` details
+- [x] Decision latency p50/p95 recorded per backend — clef p50 2729ms / p95 2918ms (n=10, single 5.7k-tok decision request); jev p50 2433ms / p95 2452ms (n=3, 5.4k-tok single-batch request); recorded, ungated (§11)
+- [x] Harness is throwaway: runs from source, ships nothing into the package or repo dev scripts — gitignored `.scratch/gates/` (fixture.ts spike extract + RPC driver + probe + 500-injector + report); no package files, no npm scripts touched
+
+**Finding for the README (ticket 10) / freejev stance:** freejev is test-only (human ruling) — and empirically it can never ship smart compaction for >16 askables anyway: 16-questions/request server cap (400 on 18) + single-flight per account (concurrent batch 2 → 409) vs the shipped concurrent batching (§3.4). Numbers for the README eval section: reduction clef 98% region / 63% context, sanity wrong-drop 0, fallback 6/6, latency above.
