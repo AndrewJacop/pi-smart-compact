@@ -180,18 +180,21 @@ export function clampKeptRegion(entries: SessionEntry[], firstKeptEntryId: strin
 	if (b < 0) return { cancel: true };
 	const cut = Math.min(piCut, b);
 
+	// Message count over a raw-entry range [from, to) — pi's projected span, absent context edits.
+	const countSpan = (from: number, to: number): number => {
+		let n = 0;
+		for (let i = Math.max(0, from); i < to; i++) n += spanMessageCount(entries[i]);
+		return n;
+	};
+
 	// The one documented cancel (§7): the clamp emptied the summarizable span
 	// (lastCompaction, cut) — nothing legal to summarize, a no-op entry would churn.
 	let lastCompaction = -1;
 	for (let i = 0; i < piCut; i++) if (entries[i].type === "compaction") lastCompaction = i;
-	let spanMsgs = 0;
-	for (let i = lastCompaction + 1; i < cut; i++) spanMsgs += spanMessageCount(entries[i]);
-	if (spanMsgs === 0) return { cancel: true };
+	if (countSpan(lastCompaction + 1, cut) === 0) return { cancel: true };
 
 	// Exempt = the span messages the clamped cut retains = the region array's tail.
-	let exemptCount = 0;
-	for (let i = cut; i < piCut; i++) exemptCount += spanMessageCount(entries[i]);
-	return { cancel: false, firstKeptEntryId: entries[cut].id, exemptCount };
+	return { cancel: false, firstKeptEntryId: entries[cut].id, exemptCount: countSpan(cut, piCut) };
 }
 
 function fmtTok(n: number): string {

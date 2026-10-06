@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { DecisionBatch, DecisionClient, DecisionRequest } from "../extensions/smart-compact/client.ts";
-import { clampKeptRegion } from "../extensions/smart-compact/live.ts";
+import { clampKeptRegion, keptRegionTokens } from "../extensions/smart-compact/live.ts";
 import { run } from "../extensions/smart-compact/index.ts";
 
 // ---------- entry fixtures (raw path entries, as branchEntries carries them) ----------
@@ -94,12 +94,9 @@ test("clamp: reaching back past the previous compaction boundary cancels (span e
 const ENV_KEY = "OPTOLLM_API_KEY";
 let savedKey: string | undefined;
 afterEach(() => {
-	if (savedKey === undefined) delete process.env[KEY_ENV()];
-	else process.env[KEY_ENV()] = savedKey;
+	if (savedKey === undefined) delete process.env[ENV_KEY];
+	else process.env[ENV_KEY] = savedKey;
 });
-function KEY_ENV(): string {
-	return ENV_KEY;
-}
 
 const SUMMARY_USAGE = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
@@ -218,6 +215,57 @@ test("live run with keptMessages ≥ session length: clean cancel, warn, on manu
 		const r2 = await liveRun(h2, liveEvent(entries, "e3"));
 		assert.deepEqual(r2, { cancel: true });
 		assert.equal(h2.requests.length, 0);
+	} finally {
+		delete process.env.PI_CODING_AGENT_DIR;
+	}
+});
+
+test("clamp feeds the reduction gate the CLAMPED kept region (§6.6 context delta)", () => {
+	seq = 0;
+	const entries = [msgEntry(USER, "1"), msgEntry(ASSISTANT, "2"), msgEntry(TOOL_RESULT, "r"), msgEntry(USER, "4"), msgEntry(ASSISTANT, "5")];
+	const r = clampKeptRegion(entries, "e4", 3);
+	assert.ok(!r.cancel);
+	// The gate's "after" rides on this number — it must grow when the clamp keeps more,
+	// so an oversized kept region fails rung 4 (→ native) instead of re-firing every turn.
+	assert.ok(keptRegionTokens(entries, r.firstKeptEntryId) > keptRegionTokens(entries, "e4"));
+});
+
+// ---------- shadow mode: same exemption, never a cancel ----------
+
+function shadowRun(h: { requests: DecisionRequest[] }, cfg: Record<string, unknown>, event: unknown) {
+	const pi = { getSettings: () => ({ smartCompact: cfg }) } as unknown as ExtensionAPI;
+	const ctx = { ui: { notify: () => {} } } as unknown as ExtensionContext;
+	return run(
+		pi,
+		ctx,
+		new Set<string>(),
+		event as never,
+		"compact",
+		() => ({
+			async decide(req: DecisionRequest): Promise<DecisionBatch> {
+				h.requests.push(req);
+				return { ok: true, answers: { u_0_text: { type: "choice", choice: "summarize", confidence: 0.9 } } as unknown as Record<string, never>, model: "clef", inputTokens: 42 };
+			},
+		}),
+	);
+}
+
+test("shadow with keptMessages: the exempt tail is never asked (§3.2) and native is still returned", async () => {
+	savedKey = process.env[ENV_KEY];
+	process.env[ENV_KEY] = "sk-test";
+	process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "sc-kept-"));
+	try {
+		const entries = clampEntries(); // pi's span = e1..e2; pi keeps e3..e4 (2 newest)
+		const h = { requests: [] as DecisionRequest[] };
+		// N=3: newest 3 = e2,e3,e4 → boundary e2 → e2's message exempt from the shadow questions.
+		const r = await shadowRun(h, { mode: "shadow", keptMessages: 3 }, liveEvent(entries, "e3"));
+		assert.equal(r, undefined, "shadow always returns native");
+		assert.equal(h.requests.length, 1);
+		assert.deepEqual(Object.keys(h.requests[0].questions), ["u_0_text"], "only the surviving region asked");
+		// No cancel from shadow even when the clamp would empty the span — live-only config edge.
+		const h2 = { requests: [] as DecisionRequest[] };
+		const r2 = await shadowRun(h2, { mode: "shadow", keptMessages: 99 }, liveEvent(entries, "e3"));
+		assert.equal(r2, undefined);
 	} finally {
 		delete process.env.PI_CODING_AGENT_DIR;
 	}
