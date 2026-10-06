@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clefClient, type DecisionRequest } from "../extensions/smart-compact/client.ts";
+import { jevClient, type DecisionRequest } from "../extensions/smart-compact/client.ts";
 
 const req: DecisionRequest = {
 	state: { orientation: "test" },
@@ -14,7 +14,7 @@ function okResponse(body: unknown) {
 
 test("posts the Jev-shape request with bearer auth and unwraps the result envelope", async () => {
 	const seen: { url: string; init: RequestInit }[] = [];
-	const client = clefClient({
+	const client = jevClient({
 		endpoint: "https://optollm.example/v1/systemone",
 		apiKey: "sk-test",
 		timeoutMs: 1000,
@@ -43,7 +43,7 @@ test("posts the Jev-shape request with bearer auth and unwraps the result envelo
 });
 
 test("tolerates an unwrapped response", async () => {
-	const client = clefClient({
+	const client = jevClient({
 		endpoint: "https://x.example",
 		apiKey: "k",
 		timeoutMs: 1000,
@@ -65,7 +65,7 @@ test("HTTP status maps to error kinds, rung 1, no retry", async () => {
 		[503, "overloaded"],
 		[418, "other"],
 	] as const) {
-		const client = clefClient({
+		const client = jevClient({
 			endpoint: "https://x.example",
 			apiKey: "k",
 			timeoutMs: 1000,
@@ -76,12 +76,15 @@ test("HTTP status maps to error kinds, rung 1, no retry", async () => {
 		if (!batch.ok) {
 			assert.equal(batch.error.kind, kind, `status ${status}`);
 			assert.equal(batch.error.rung, 1, `status ${status}`);
+			// rate_limit/overloaded are advisory-retryable (a LATER run may succeed — e.g. freejev's
+			// 1 req/min); the client itself never retries in-hook either way (SPEC §8).
+			assert.equal(batch.error.retryable, kind === "rate_limit" || kind === "overloaded", `status ${status}`);
 		}
 	}
 });
 
 test("transport failure is network, abort is timeout", async () => {
-	const network = clefClient({
+	const network = jevClient({
 		endpoint: "https://x.example",
 		apiKey: "k",
 		timeoutMs: 1000,
@@ -93,7 +96,7 @@ test("transport failure is network, abort is timeout", async () => {
 	assert.equal(n.ok, false);
 	if (!n.ok) assert.equal(n.error.kind, "network");
 
-	const slow = clefClient({ endpoint: "https://x.example", apiKey: "k", timeoutMs: 20, fetchImpl: () => new Promise(() => {}) });
+	const slow = jevClient({ endpoint: "https://x.example", apiKey: "k", timeoutMs: 20, fetchImpl: () => new Promise(() => {}) });
 	const t = await slow.decide(req);
 	assert.equal(t.ok, false);
 	if (!t.ok) assert.equal(t.error.kind, "timeout");
@@ -101,7 +104,7 @@ test("transport failure is network, abort is timeout", async () => {
 
 test("malformed response is rung 2 (per-unit salvage territory, wholly unusable → native)", async () => {
 	for (const body of ["<html>gateway error</html>", { nope: true }, { answers: "not-an-object" }]) {
-		const client = clefClient({
+		const client = jevClient({
 			endpoint: "https://x.example",
 			apiKey: "k",
 			timeoutMs: 1000,
@@ -114,7 +117,7 @@ test("malformed response is rung 2 (per-unit salvage territory, wholly unusable 
 });
 
 test("an already-aborted signal short-circuits to timeout", async () => {
-	const client = clefClient({
+	const client = jevClient({
 		endpoint: "https://x.example",
 		apiKey: "k",
 		timeoutMs: 5000,
@@ -127,4 +130,100 @@ test("an already-aborted signal short-circuits to timeout", async () => {
 	const batch = await client.decide(req, ctrl.signal);
 	assert.equal(batch.ok, false);
 	if (!batch.ok) assert.equal(batch.error.kind, "timeout");
+});
+
+// ---- ticket 08: the one adapter serves all four backends ----
+
+test("no apiKey → no authorization header (ollama ships keyless)", async () => {
+	const seen: RequestInit[] = [];
+	const client = jevClient({
+		endpoint: "http://localhost:11434/v1/systemone",
+		apiKey: "",
+		timeoutMs: 1000,
+		fetchImpl: async (_url, init) => {
+			seen.push(init ?? {});
+			return okResponse({ answers: { u_1: { type: "choice", choice: "keep" } }, model: "clef-flash", usage: { input_tokens: 1 } });
+		},
+	});
+	const batch = await client.decide(req);
+	assert.equal(batch.ok, true);
+	assert.equal((seen[0].headers as Record<string, string>).authorization, undefined);
+});
+
+test("omitModel ships state+questions only (freejev pins the model server-side); default sends it", async () => {
+	const bodies: unknown[] = [];
+	const mk = (omitModel: boolean) =>
+		jevClient({
+			endpoint: "https://x.example",
+			apiKey: "k",
+			timeoutMs: 1000,
+			omitModel,
+			fetchImpl: async (_url, init) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return okResponse({ answers: {}, model: "typesafe/jev-1.13-20260917", usage: { input_tokens: 1 } });
+			},
+		});
+	await mk(true).decide(req);
+	await mk(false).decide(req);
+	assert.deepEqual(bodies[0], { state: req.state, questions: req.questions });
+	assert.deepEqual(bodies[1], req);
+});
+
+test("402 (empty balance) → other, rung 1, non-retryable → native, no retry", async () => {
+	const client = jevClient({
+		endpoint: "https://freejev.example/api/v1/decisions",
+		apiKey: "k",
+		timeoutMs: 1000,
+		fetchImpl: async () => new Response(JSON.stringify({ error: "empty balance" }), { status: 402 }),
+	});
+	const batch = await client.decide(req);
+	assert.equal(batch.ok, false);
+	if (!batch.ok) {
+		assert.equal(batch.error.kind, "other");
+		assert.equal(batch.error.rung, 1);
+		assert.equal(batch.error.retryable, false);
+	}
+});
+
+test("idempotency-key = content-hash + attempt: identical runs derive the same key, a retry attempt a fresh one", async () => {
+	const keys: string[] = [];
+	const mk = () =>
+		jevClient({
+			endpoint: "https://freejev.example/api/v1/decisions",
+			apiKey: "k",
+			timeoutMs: 1000,
+			idempotency: true,
+			fetchImpl: async (_url, init) => {
+				keys.push((init?.headers as Record<string, string>)["idempotency-key"]);
+				return okResponse({ answers: {}, model: "jev", usage: { input_tokens: 1 } });
+			},
+		});
+	await mk().decide(req); // run 1, attempt 1
+	await mk().decide(req); // run 2, identical redacted content → same key
+	const retried = mk();
+	await retried.decide(req); // attempt 1 → same key
+	await retried.decide(req); // attempt 2 → fresh key
+	assert.equal(keys[1], keys[0], "identical content, same attempt → same key");
+	assert.equal(keys[2], keys[0], "fresh client restarts the attempt counter");
+	assert.notEqual(keys[3], keys[0], "retry attempt derives a fresh key");
+	assert.match(keys[0], /^[0-9a-f]{32}-1$/);
+	assert.match(keys[3], /^[0-9a-f]{32}-2$/);
+});
+
+test("idempotency-key hashes the POST-redaction body: different content → different key", async () => {
+	const keys: string[] = [];
+	const mk = () =>
+		jevClient({
+			endpoint: "https://x.example",
+			apiKey: "k",
+			timeoutMs: 1000,
+			idempotency: true,
+			fetchImpl: async (_url, init) => {
+				keys.push((init?.headers as Record<string, string>)["idempotency-key"]);
+				return okResponse({ answers: {}, model: "jev", usage: { input_tokens: 1 } });
+			},
+		});
+	await mk().decide(req);
+	await mk().decide({ ...req, state: { orientation: "different" } });
+	assert.notEqual(keys[1], keys[0]);
 });

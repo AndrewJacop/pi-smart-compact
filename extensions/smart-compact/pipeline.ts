@@ -418,11 +418,13 @@ export async function decideRegion(
 		}
 	}
 
-	// Shared state through the fitting ladder; exhausted → native (rung 1, SPEC §3.4).
-	// The ladder is client-side for every backend — clef because it silently truncates
-	// over-limit state, jev because it would 400 — so truncateStateClientSide no longer
-	// gates here (ticket-02's crude trim was its placeholder).
-	const fitted = fitState(units, profile.stateTokenBudget);
+	// Shared state through the fitting ladder (SPEC §3.4) — client-side truncation is per-profile
+	// policy (§5.2): clef-family + freejev fit the budget client-side (clef silently truncates
+	// over-limit state, freejev's 128 KB body would 400); jev-direct ships the full-stage state
+	// and lets the API enforce size — its 400 surfaces as the rung-1 fallback below. Exhausted
+	// ladder → native (rung 1). One resolved budget feeds both the ladder and the chunk clamp.
+	const tokenBudget = profile.truncateStateClientSide ? profile.stateTokenBudget : Number.POSITIVE_INFINITY;
+	const fitted = fitState(units, tokenBudget);
 	if (!fitted) {
 		return {
 			ok: false,
@@ -463,9 +465,12 @@ export async function decideRegion(
 
 	// Chunk askables into concurrent batches (SPEC §3.4): ≤ profile.maxQuestions questions per
 	// batch and state + questions within the per-request token budget. The same state is resent
-	// with every batch; answers merge by question id. Questions too big for what the budget has
-	// left default to keep.
-	const questionBudget = Math.max(0, profile.stateTokenBudget - estimateStateTokens(egressState));
+	// with every batch; answers merge by question id. Without client truncation (jev-direct)
+	// there is no client-side size clamp at all — only maxQuestions chunks; the API enforces
+	// size and its 400 falls back at rung 1. Questions too big for the budget left default to keep.
+	const questionBudget = profile.truncateStateClientSide
+		? Math.max(0, tokenBudget - estimateStateTokens(egressState))
+		: tokenBudget; // no client truncation (jev-direct): no client-side size clamp, the API enforces
 	const batches: Unit[][] = []; // (chunking detail unchanged from ticket 02)
 	let current: Unit[] = [];
 	let currentTokens = 0;

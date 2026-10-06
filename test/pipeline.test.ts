@@ -196,25 +196,23 @@ test("transport failure (auth/timeout/500 shapes) → native at rung 1, exactly 
 	}
 });
 
-test("oversize state fits through the ladder at any truncateStateClientSide setting; exhaustion → native rung 1", async () => {
+test("oversize state fits through the ladder when client-side truncation is on; exhaustion → native rung 1", async () => {
 	const collected: unknown[] = [];
 	// pad so bulky units sit outside the recent window and the ladder has material to degrade
 	const padded = [...bigRegion(), ...Array.from({ length: 6 }, (_, i) => assistant([{ type: "text", text: `padding ${i}` }]))];
-	// small budget forces a degraded stage, regardless of the (superseded) truncate flag
-	for (const flag of [true, false]) {
-		collected.length = 0;
-		const capture: { requests?: DecisionRequest[] } = {};
-		const trimmed = await runShadow(deps(setupClient(REGION_ANSWERS, capture), collected), OPTS, profile({ stateTokenBudget: 600, truncateStateClientSide: flag }), {
-			messages: padded,
-			kind: "compact",
-		});
-		assert.equal(trimmed.outcome, "shadowed");
-		const state = capture.requests?.[0]?.state as { region: { id: string; text?: string }[] };
-		const tokens = estimateTextTokens(JSON.stringify(state));
-		assert.ok(tokens <= 600, `fitted state ${tokens} tok should fit budget 600`);
-		const stage = (collected[0] as { stage: string }).stage;
-		assert.notEqual(stage, "full");
-	}
+	// small budget forces a degraded stage under the clef profile (truncate on)
+	collected.length = 0;
+	const capture: { requests?: DecisionRequest[] } = {};
+	const trimmed = await runShadow(deps(setupClient(REGION_ANSWERS, capture), collected), OPTS, profile({ stateTokenBudget: 600 }), {
+		messages: padded,
+		kind: "compact",
+	});
+	assert.equal(trimmed.outcome, "shadowed");
+	const state = capture.requests?.[0]?.state as { region: { id: string; text?: string }[] };
+	const tokens = estimateTextTokens(JSON.stringify(state));
+	assert.ok(tokens <= 600, `fitted state ${tokens} tok should fit budget 600`);
+	const stage = (collected[0] as { stage: string }).stage;
+	assert.notEqual(stage, "full");
 
 	// a budget below the pinned+recent floor exhausts the ladder → native at rung 1
 	collected.length = 0;
@@ -505,12 +503,131 @@ test("branch kind tags the toast with [branch]", async () => {
 	assert.match(result.toast ?? "", /^smart-compact \[shadow\]\[branch\]/);
 });
 
-test("unwired backend profile → native at rung 1 (only clef ships in ticket 02)", async () => {
+test("unwired backend profile → native at rung 1", async () => {
 	const collected: unknown[] = [];
-	const result = await runShadow(deps(setupClient({}), collected), { backend: "jev", matrix: DEFAULT_MATRIX }, effectiveProfile("jev", undefined), {
+	const result = await runShadow(deps(setupClient({}), collected), { backend: "nope", matrix: DEFAULT_MATRIX }, effectiveProfile("nope", undefined), {
 		messages: bigRegion(),
 		kind: "compact",
 	});
 	assert.equal(result.outcome, "fallback");
 	assert.equal((collected[0] as { fallback: { rung: number } }).fallback.rung, 1);
+});
+
+// ---- ticket 08: per-profile knobs drive the one pipeline ----
+
+test("jev-direct: no client-side truncation — oversize state still ships and the API's 400 is rung 1", async () => {
+	const tinyBudget = { stateTokenBudget: 100 };
+	const err400 = { ok: false as const, error: { kind: "input_too_large" as const, retryable: false, rung: 1 as const, message: "HTTP 400: state too large" } };
+
+	// truncate: false (the shipped jev-direct default) → the request FIRES, the API 400s, rung 1
+	let calls = 0;
+	const failing = {
+		async decide(): Promise<DecisionBatch> {
+			calls++;
+			return err400;
+		},
+	};
+	const collected: unknown[] = [];
+	const result = await runShadow(deps(failing, collected), { backend: "jev-direct", matrix: DEFAULT_MATRIX }, effectiveProfile("jev-direct", tinyBudget), {
+		messages: bigRegion(),
+		kind: "compact",
+	});
+	assert.equal(result.outcome, "fallback");
+	assert.equal(calls, 1, "the request shipped despite the tiny budget — no client-side fit or clamp");
+	const record = collected[0] as { fallback: { rung: number; error: string }; stage: string };
+	assert.equal(record.fallback.rung, 1);
+	assert.match(record.fallback.error, /input_too_large/);
+
+	// the identical budget WITH client-side truncation → ladder exhaustion → native with NO request
+	let truncCalls = 0;
+	const collected2: unknown[] = [];
+	await runShadow(
+		deps({
+			async decide(): Promise<DecisionBatch> {
+				truncCalls++;
+				return err400;
+			},
+		}, collected2),
+		{ backend: "jev-direct", matrix: DEFAULT_MATRIX },
+		effectiveProfile("jev-direct", { ...tinyBudget, truncateStateClientSide: true }),
+		{ messages: bigRegion(), kind: "compact" },
+	);
+	assert.equal(truncCalls, 0, "ladder exhaustion fails native before any request");
+	assert.equal((collected2[0] as { fallback: { rung: number } }).fallback.rung, 1);
+	assert.equal((collected2[0] as { stage: string }).stage, "merged-calls");
+});
+
+test("jev-direct ships the full-stage state and never clamps questions by the budget", async () => {
+	const capture: { requests?: DecisionRequest[] } = {};
+	const echo = {
+		async decide(r: DecisionRequest): Promise<DecisionBatch> {
+			capture.requests ??= [];
+			capture.requests.push(r);
+			return {
+				ok: true,
+				answers: Object.fromEntries(Object.keys(r.questions).map((id) => [id, { type: "choice", choice: "keep", confidence: 0.9 }])),
+				model: "jev-1.13.0",
+				inputTokens: 1,
+			};
+		},
+	};
+	const collected: unknown[] = [];
+	// budget 100 ≪ the full-stage state, truncate off: nothing dropped, everything asked in one batch
+	const result = await runShadow(deps(echo, collected), { backend: "jev-direct", matrix: DEFAULT_MATRIX }, effectiveProfile("jev-direct", { stateTokenBudget: 100 }), {
+		messages: bigRegion(),
+		kind: "compact",
+	});
+	assert.equal(result.outcome, "shadowed");
+	const req = capture.requests?.[0];
+	assert.ok(req);
+	assert.equal(Object.keys(req.questions).length, 4, "all askables asked despite the tiny budget");
+	const record = collected[0] as { stage: string };
+	assert.equal(record.stage, "full");
+});
+
+test("per-profile maxQuestions chunks independently (jev ships 16, no clef leak)", async () => {
+	const messages = Array.from({ length: 30 }, (_, i) => assistant([{ type: "text", text: `msg ${i}` }]));
+	const mk = () => {
+		const capture: { requests?: DecisionRequest[] } = {};
+		const client = {
+			async decide(r: DecisionRequest): Promise<DecisionBatch> {
+				capture.requests ??= [];
+				capture.requests.push(r);
+				return {
+					ok: true,
+					answers: Object.fromEntries(Object.keys(r.questions).map((id) => [id, { type: "choice", choice: "keep", confidence: 0.9 }])),
+					model: "jev",
+					inputTokens: 1,
+				};
+			},
+		};
+		return { capture, client };
+	};
+	const a = mk();
+	await runShadow(deps(a.client, []), { backend: "jev", matrix: DEFAULT_MATRIX }, effectiveProfile("jev", undefined), { messages, kind: "compact" });
+	assert.equal(a.capture.requests?.length, 2, "30 askables chunk 16+14 under jev's shipped cap");
+	assert.deepEqual(a.capture.requests?.map((r) => Object.keys(r.questions).length), [16, 14]);
+
+	const b = mk();
+	await runShadow(deps(b.client, []), OPTS, profile({ maxQuestions: 10 }), { messages, kind: "compact" });
+	assert.deepEqual(b.capture.requests?.map((r) => Object.keys(r.questions).length), [10, 10, 10], "clef override chunks by its own cap");
+});
+
+test("per-profile confidenceFloor: a raised floor on one profile escalates; clef's 0.1 still honors the same answer", async () => {
+	const answers = {
+		u_1_text: { type: "choice", choice: "summarize", confidence: 0.3 },
+		u_1_think: { type: "choice", choice: "drop", confidence: 0.9 },
+		u_1_call: { type: "choice", choice: "keep", confidence: 0.9 },
+		u_2: { type: "choice", choice: "keep", confidence: 0.9 },
+	};
+	const actionsFor = async (p: ReturnType<typeof effectiveProfile>) => {
+		const collected: unknown[] = [];
+		await runShadow(deps(setupClient(answers), collected), OPTS, p, { messages: bigRegion(), kind: "compact" });
+		const record = collected[0] as { units: { id: string; action: string }[] };
+		return new Map(record.units.map((u) => [u.id, u.action]));
+	};
+	const clef = await actionsFor(profile()); // shipped floor 0.1
+	assert.equal(clef.get("u_1_text"), "summarize", "0.3 ≥ clef floor 0.1 → honored");
+	const jev = await actionsFor(effectiveProfile("jev", { confidenceFloor: 0.5 }));
+	assert.equal(jev.get("u_1_text"), "keep", "0.3 < jev floor 0.5 → escalated to keep");
 });

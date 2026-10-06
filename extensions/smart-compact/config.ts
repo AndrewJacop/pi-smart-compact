@@ -1,5 +1,6 @@
 // Config loading and validation for the `smartCompact` settings key (SPEC §5.3).
 // Invalid config fails loud: warn, smart path off, native compaction, never guess.
+import type { JevClientOptions } from "./client.ts";
 
 export type Action = "keep" | "summarize" | "drop";
 export type UnitType = "user" | "previous-summary" | "assistant-text" | "thinking" | "tool-call" | "tool-result";
@@ -52,15 +53,15 @@ export const DEFAULT_MATRIX: Record<UnitType, Action[]> = {
 	"tool-result": ["keep", "summarize", "drop"],
 };
 
-/** Shipped backend profiles (SPEC §5.2) and the env var that unlocks each (§5.4). */
-export const BACKENDS: Record<string, { env: string | null }> = {
+/** Shipped backend profiles (SPEC §5.2) and what unlocks/wires each (§5.4): the env var that must be set (null = keyless, ollama) plus the adapter's wire deltas (jev pins its model server-side and mandates the Idempotency-Key, §8.4). */
+export const BACKENDS: Record<string, { env: string | null; omitModel?: boolean; idempotency?: boolean }> = {
 	clef: { env: "OPTOLLM_API_KEY" },
-	jev: { env: "FREEJEV_API_KEY" },
-	"jev-direct": { env: "TYPESAFE_API_KEY" }, // provisional name — §5.4 doesn't name it; confirm in ticket 08
+	jev: { env: "FREEJEV_API_KEY", omitModel: true, idempotency: true },
+	"jev-direct": { env: "TYPESAFE_API_KEY" }, // the TypeSafe provider key (§5.2); named in ticket 08
 	ollama: { env: null },
 };
 
-/** The shipped wire-level profile per backend; the user's `profiles` entry merges over it. */
+/** The wire-level profile per backend (SPEC §5.2); the user's `profiles` entry merges over it. */
 export interface BackendProfile {
 	endpoint: string;
 	model: string;
@@ -73,7 +74,7 @@ export interface BackendProfile {
 	candidatesMax: number;
 }
 
-/** Only clef ships in ticket 02; jev / ollama / jev-direct wire up in ticket 08. */
+/** All four shipped wire profiles (ticket 08); the user's `profiles` entry merges over it. */
 export const BACKEND_PROFILES: Record<string, BackendProfile> = {
 	clef: {
 		endpoint: "https://optollm.optomatica.com/v1/systemone",
@@ -82,6 +83,36 @@ export const BACKEND_PROFILES: Record<string, BackendProfile> = {
 		stateTokenBudget: 25000,
 		truncateStateClientSide: true, // clef silently truncates over-limit state — pre-trim (SPEC §5.2)
 		confidenceFloor: 0.1, // shared floor (SPEC §8.5)
+		candidatesMin: 2,
+		candidatesMax: 26,
+	},
+	jev: {
+		endpoint: "https://freejev.org/api/v1/decisions",
+		model: "typesafe/jev-1.13-20260917", // pinned server-side; the adapter omits it from the request
+		maxQuestions: 16, // ≤ 16 questions/req; hard 1 req/min on this key — smoke tests only
+		stateTokenBudget: 24000, // 128 KB body cap (state + questions + envelope ≈ 32k tok)
+		truncateStateClientSide: true, // a 128 KB oversize body is a guaranteed 400 — fit it client-side
+		confidenceFloor: 0.1,
+		candidatesMin: 2,
+		candidatesMax: 26,
+	},
+	ollama: {
+		endpoint: "http://localhost:11434/v1/systemone",
+		model: "clef-flash",
+		maxQuestions: 20,
+		stateTokenBudget: 25000,
+		truncateStateClientSide: true,
+		confidenceFloor: 0.1,
+		candidatesMin: 2,
+		candidatesMax: 26,
+	},
+	"jev-direct": {
+		endpoint: "https://api.typesafe.ai/v1/systemone",
+		model: "jev-1.13.0",
+		maxQuestions: 64, // no documented server cap — 64 chunks within the 64k tok/req envelope
+		stateTokenBudget: 64000, // 64k tok/req; oversize → the API's 400, never truncated (§5.2)
+		truncateStateClientSide: false, // no client truncation — the API errors on oversize instead
+		confidenceFloor: 0.1,
 		candidatesMin: 2,
 		candidatesMax: 26,
 	},
@@ -299,4 +330,16 @@ export function missingBackendKey(backend: string, env: NodeJS.ProcessEnv = proc
 	const entry = BACKENDS[backend];
 	if (!entry || entry.env === null) return null;
 	return env[entry.env] ? null : entry.env;
+}
+
+/** Client options per backend (ticket 08): endpoint from the profile, key from the env table, wire deltas from BACKENDS. Pure so tests dispatch without a live env. Unwired profile → dead client (decideRegion fails rung 1 before any call). */
+export function clientOptionsFor(backend: string, profile: BackendProfile | null, timeoutMs: number, env: NodeJS.ProcessEnv = process.env): JevClientOptions {
+	const entry = BACKENDS[backend];
+	return {
+		endpoint: profile?.endpoint ?? "",
+		apiKey: (entry?.env && env[entry.env]) || "",
+		timeoutMs,
+		omitModel: entry?.omitModel ?? false,
+		idempotency: entry?.idempotency ?? false,
+	};
 }

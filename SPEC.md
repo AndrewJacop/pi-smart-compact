@@ -156,7 +156,7 @@ Per-profile config: `{ model, maxQuestions, stateTokenBudget, truncateStateClien
 
 ### 5.4 Key setup (docs)
 
-Env vars via a gitignored `.env.local` sourced before launching pi: `OPTOLLM_API_KEY` (clef), `FREEJEV_API_KEY` (jev, 1 req/min caveat), none for Ollama. Never commit or print keys. (Spike keys were rotated post-spike.)
+Env vars via a gitignored `.env.local` sourced before launching pi: `OPTOLLM_API_KEY` (clef), `FREEJEV_API_KEY` (jev, 1 req/min caveat), `TYPESAFE_API_KEY` (jev-direct), none for Ollama. Never commit or print keys. (Spike keys were rotated post-spike.)
 
 ### 5.5 Default question set (`questions.default.json`)
 

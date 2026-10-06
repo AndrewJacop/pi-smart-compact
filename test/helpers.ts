@@ -36,7 +36,7 @@ export interface Capture {
 
 export function stubMakeClient(answers: unknown, capture: Capture) {
 	capture.requests = [];
-	return (_profile: { endpoint: string }, _timeoutMs: number) => ({
+	return (_backend: string, _profile: unknown, _timeoutMs: number) => ({
 		async decide(req: DecisionRequest): Promise<DecisionBatch> {
 			capture.requests!.push(req);
 			return { ok: true, answers: answers as Record<string, never>, model: "clef", inputTokens: 321 };

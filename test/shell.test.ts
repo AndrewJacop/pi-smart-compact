@@ -165,6 +165,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "../extensions/smart-compact/index.ts";
 import type { DecisionBatch, DecisionClient } from "../extensions/smart-compact/client.ts";
+import { clientOptionsFor, effectiveProfile } from "../extensions/smart-compact/config.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 let savedAgentDir: string | undefined;
@@ -200,7 +201,7 @@ function ctxCapture() {
 }
 
 function stubClient(answers: unknown, calls: { n: number }) {
-	return (_profile: { endpoint: string }, _timeoutMs: number): DecisionClient => ({
+	return (_backend: string, _profile: unknown, _timeoutMs: number): DecisionClient => ({
 		async decide(): Promise<DecisionBatch> {
 			calls.n++;
 			return { ok: true, answers: answers as Record<string, never>, model: "clef", inputTokens: 42 };
@@ -286,4 +287,39 @@ test("shadow + transport failure: native, warn toast, rung-1 record", async () =
 		const record = JSON.parse(readFileSync(join(dir, "smart-compact", "telemetry.jsonl"), "utf8").trim());
 		assert.equal(record.fallback.rung, 1);
 	});
+});
+
+// ---- ticket 08: one adapter, per-backend factory dispatch ----
+
+const p = (b: string) => effectiveProfile(b, undefined);
+
+test("client factory dispatch: env key + wire deltas per backend", () => {
+	const base = (endpoint: string) => ({ endpoint, timeoutMs: 5000 });
+	assert.deepEqual(clientOptionsFor("clef", p("clef"), 5000, { OPTOLLM_API_KEY: "oc" }), {
+		...base("https://optollm.optomatica.com/v1/systemone"),
+		apiKey: "oc",
+		omitModel: false,
+		idempotency: false,
+	});
+	assert.deepEqual(clientOptionsFor("jev", p("jev"), 5000, { FREEJEV_API_KEY: "fj" }), {
+		...base("https://freejev.org/api/v1/decisions"),
+		apiKey: "fj",
+		omitModel: true, // model pinned server-side
+		idempotency: true, // mandatory Idempotency-Key
+	});
+	assert.deepEqual(clientOptionsFor("ollama", p("ollama"), 5000, {}), {
+		...base("http://localhost:11434/v1/systemone"),
+		apiKey: "",
+		omitModel: false,
+		idempotency: false,
+	});
+	assert.deepEqual(clientOptionsFor("jev-direct", p("jev-direct"), 5000, { TYPESAFE_API_KEY: "ts" }), {
+		...base("https://api.typesafe.ai/v1/systemone"),
+		apiKey: "ts",
+		omitModel: false,
+		idempotency: false,
+	});
+	// unwired profile: dead client, never called (decideRegion fails rung 1 first)
+	assert.equal(clientOptionsFor("nope", null, 5000, {}).endpoint, "");
+	assert.equal(clientOptionsFor("clef", p("clef"), 5000, {}).apiKey, "");
 });

@@ -5,8 +5,8 @@
 // composition via the targeted summarizer + composer + reduction gate (ticket 04).
 import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionBeforeTreeEvent, SessionBeforeTreeResult } from "@earendil-works/pi-coding-agent";
 import { estimateTokens, generateSummaryWithUsage, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
-import { clefClient, type DecisionClient } from "./client.ts";
-import { effectiveProfile, isObject, missingBackendKey, validateSmartCompact } from "./config.ts";
+import { jevClient, type DecisionClient } from "./client.ts";
+import { clientOptionsFor, effectiveProfile, isObject, missingBackendKey, validateSmartCompact, type BackendProfile } from "./config.ts";
 import { keptRegionTokens, clampKeptRegion, runLive, type LiveFileOps, type LiveResult, type SummarizerFn } from "./live.ts";
 import { loadQuestionSet, runShadow } from "./pipeline.ts";
 import { appendTelemetry, telemetryDir } from "./telemetry.ts";
@@ -20,8 +20,8 @@ function overrideQuestionsPath(): string {
 	return join(telemetryDir(), "questions.json");
 }
 
-function defaultMakeClient(profile: { endpoint: string }, decisionTimeoutMs: number): DecisionClient {
-	return clefClient({ endpoint: profile.endpoint, apiKey: process.env.OPTOLLM_API_KEY ?? "", timeoutMs: decisionTimeoutMs });
+function defaultMakeClient(backend: string, profile: BackendProfile | null, decisionTimeoutMs: number): DecisionClient {
+	return jevClient(clientOptionsFor(backend, profile, decisionTimeoutMs));
 }
 
 /** The default summarizer: pi's own summary-with-usage call, authed off the session model. */
@@ -103,7 +103,7 @@ export async function run(
 	warned: Set<string>,
 	event: SessionBeforeCompactEvent | SessionBeforeTreeEvent,
 	kind: Kind,
-	makeClient: (profile: { endpoint: string }, decisionTimeoutMs: number) => DecisionClient = defaultMakeClient,
+	makeClient: (backend: string, profile: BackendProfile | null, decisionTimeoutMs: number) => DecisionClient = defaultMakeClient,
 	makeSummarizer: (ctx: ExtensionContext) => SummarizerFn = defaultMakeSummarizer,
 ): Promise<SessionBeforeCompactResult | SessionBeforeTreeResult | undefined> {
 	const raw = (pi.getSettings() as Record<string, unknown>).smartCompact;
@@ -154,7 +154,7 @@ export async function run(
 
 	const profile = effectiveProfile(cfg.backend, cfg.profiles[cfg.backend]);
 	const decisionDeps = {
-		client: makeClient({ endpoint: profile?.endpoint ?? "" }, cfg.decisionTimeoutMs),
+		client: makeClient(cfg.backend, profile, cfg.decisionTimeoutMs),
 		writeTelemetry: (record: unknown) => {
 			appendTelemetry(telemetryDir(), record);
 		},

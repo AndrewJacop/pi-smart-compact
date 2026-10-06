@@ -4,6 +4,7 @@ import {
 	BACKENDS,
 	DEFAULT_DECISION_TIMEOUT_MS,
 	DEFAULT_MIN_REDUCTION_PCT,
+	effectiveProfile,
 	missingBackendKey,
 	validateSmartCompact,
 } from "../extensions/smart-compact/config.ts";
@@ -158,6 +159,7 @@ test("BACKENDS table: key env vars per shipped profile (SPEC §5.2/§5.4)", () =
 	assert.equal(BACKENDS.clef.env, "OPTOLLM_API_KEY");
 	assert.equal(BACKENDS.jev.env, "FREEJEV_API_KEY");
 	assert.equal(BACKENDS.ollama.env, null);
+	assert.equal(BACKENDS["jev-direct"].env, "TYPESAFE_API_KEY");
 });
 
 test("missingBackendKey reads the env live", () => {
@@ -167,4 +169,31 @@ test("missingBackendKey reads the env live", () => {
 	assert.equal(missingBackendKey("clef", { OPTOLLM_API_KEY: "sk-x" }), null);
 	assert.equal(missingBackendKey("ollama", env), null); // no key needed
 	assert.equal(missingBackendKey("jev", env), "FREEJEV_API_KEY");
+	assert.equal(missingBackendKey("jev-direct", env), "TYPESAFE_API_KEY");
+});
+
+test("all four shipped profiles exist with their §5.2 wire defaults", () => {
+	for (const backend of ["clef", "jev", "ollama", "jev-direct"]) {
+		assert.ok(effectiveProfile(backend, undefined), `${backend} ships`);
+	}
+	const jev = effectiveProfile("jev", undefined)!;
+	assert.equal(jev.endpoint, "https://freejev.org/api/v1/decisions");
+	assert.equal(jev.maxQuestions, 16); // ≤ 16 questions/req
+	assert.match(jev.model, /^typesafe\/jev/); // server-pinned
+	const ollama = effectiveProfile("ollama", undefined)!;
+	assert.equal(ollama.endpoint, "http://localhost:11434/v1/systemone");
+	assert.equal(ollama.model, "clef-flash");
+	assert.equal(ollama.maxQuestions, 20);
+	assert.equal(ollama.truncateStateClientSide, true);
+	const direct = effectiveProfile("jev-direct", undefined)!;
+	assert.equal(direct.model, "jev-1.13.0");
+	assert.equal(direct.stateTokenBudget, 64000); // 64k tok/req, API enforces
+	assert.equal(direct.truncateStateClientSide, false); // oversize → the API's 400, never truncated
+});
+
+test("per-profile overrides merge over each shipped profile (no cross-profile leakage)", () => {
+	const jev = effectiveProfile("jev", { confidenceFloor: 0.4 });
+	assert.equal(jev?.confidenceFloor, 0.4);
+	assert.equal(effectiveProfile("clef", undefined)?.confidenceFloor, 0.1); // clef floor untouched
+	assert.equal(effectiveProfile("ollama", { maxQuestions: 5 })?.maxQuestions, 5);
 });

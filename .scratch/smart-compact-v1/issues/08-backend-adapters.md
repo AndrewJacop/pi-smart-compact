@@ -4,11 +4,13 @@
 
 **Blocked by:** 02 — Decision pipeline in shadow mode (client contract + clef reference implementation); 05 — Privacy redaction (idempotency key derives from redacted content).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Switching `backend` config between clef/jev/ollama/jev-direct changes only the adapter; pipeline behavior and fail-open policy identical
-- [ ] Ollama profile works against a local server with no key configured
-- [ ] freejev requests carry the mandatory Idempotency-Key; repeated identical runs derive the same key after redaction, a retry attempt derives a fresh one
-- [ ] freejev 402 (empty balance) and 429 (rate limit) → native, rung 1, no retry
-- [ ] jev-direct oversize state → the API's 400 surfaces as a fallback rung (no client-side truncation on this profile)
-- [ ] Per-profile confidenceFloor and maxQuestions take effect (a clef-calibrated floor doesn't leak into other profiles)
+**Review notes:** `TYPESAFE_API_KEY` confirmed in this ticket as the jev-direct env var (§5.4 names only clef/jev/ollama; the provider is TypeSafe per §5.2) — now recorded in SPEC §5.4. jev-direct `maxQuestions: 64` is a client chunk bound (§5.2 documents no server cap); the real limit is the 64k tok/req envelope, enforced by the API. Code review (two-axis) findings all addressed or noted; the one substantive catch — a ticket draft misstating 429's `retryable` flag — is fixed above (the behaviour was always spec-correct).
+
+- [x] Switching `backend` config between clef/jev/ollama/jev-direct changes only the adapter; pipeline behavior and fail-open policy identical — all four speak the canonical Jev wire through one `jevClient` adapter; per-backend deltas are adapter options (apiKey/omitModel/idempotency) dispatched in `clientOptionsFor`; the pipeline is profile-driven and shared (tested: same region, per-profile chunking + floors, unwired → rung 1)
+- [x] Ollama profile works against a local server with no key configured — empty `apiKey` ships no authorization header; `missingBackendKey("ollama")` stays null (rung 0 passes)
+- [x] freejev requests carry the mandatory Idempotency-Key; repeated identical runs derive the same key after redaction, a retry attempt derives a fresh one — key = sha256(POST-redaction body).slice(0,32)-attempt; attempt is a per-client (≈ per-run) counter, so every request on one client derives a fresh key while identical first attempts across runs hash identically (chunk bodies differ anyway, so multi-chunk runs stay unique); redaction runs once inside `decideRegion` before any client sees the request (ticket 05 structurally guaranteed this). Live smoke evidence 2026-10-06: one request via `jevClient({endpoint: freejev, omitModel, idempotency})` — `ok:true`, answer `u_1 keep` (conf 0.01 → floor escalates), server-pinned model echoed, 2668 ms, single request = 1 req/min respected
+- [x] freejev 402 (empty balance) and 429 (rate limit) → native, rung 1, no retry — 402 maps kind "other", 429 maps kind "rate_limit" with `retryable: true` (advisory: a LATER run may succeed given the 1 req/min window); the client never retries in-hook either way, any `ok:false` → native rung 1 (tested: 402 flags + the status matrix now asserts retryable per kind)
+- [x] jev-direct oversize state → the API's 400 surfaces as a fallback rung (no client-side truncation on this profile) — `truncateStateClientSide: false` skips the ladder (state stays "full") and the question-budget clamp; the API 400 maps to input_too_large rung 1 → native (tested both directions of the knob)
+- [x] Per-profile confidenceFloor and maxQuestions take effect (a clef-calibrated floor doesn't leak into other profiles) — per-profile overrides merge over shipped profiles only (tested: jev floor 0.5 escalates where clef's 0.1 honors; jev chunks 16+14 vs clef override 10×3)

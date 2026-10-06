@@ -196,7 +196,7 @@ test("live branch fallback: decision failure → undefined (pi's native branch s
 			const ctx = { ui: { notify: (...args: unknown[]) => calls.push(args) } } as unknown as ExtensionContext;
 			const pi = { getSettings: () => ({ smartCompact: { mode: "live" } }) } as unknown as ExtensionAPI;
 			const capture: Capture = { requests: [], summarizeCalls: [] };
-			const failing = (_profile: { endpoint: string }, _timeoutMs: number) => ({
+			const failing = (_backend: string, _profile: unknown, _timeoutMs: number) => ({
 				async decide(): Promise<DecisionBatch> {
 					capture.requests!.push({} as DecisionRequest);
 					return { ok: false, error: { kind: "timeout", retryable: false, rung: 1 as const, message: "decision timed out" } };
