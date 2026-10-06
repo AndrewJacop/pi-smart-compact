@@ -1,12 +1,12 @@
-// The decision pipeline in shadow mode (SPEC §3, §8.1; v1 ticket 02):
-// split → partition (pinned vs askable) → shared state → questions → decide →
-// map (argmax∩subset + confidence floor) → repair (call := min(call, result)).
-// Shadow runs decisions only, records telemetry + the [shadow] toast, and always
-// returns native (compaction: undefined).
+// The decision pipeline in shadow mode (SPEC §3, §8.1; v1 tickets 02+03):
+// split → partition (pinned vs askable) → state-fitting ladder → chunked
+// concurrent decide → map (argmax∩subset + confidence floor) → repair
+// (call := min(call, result)). Shadow runs decisions only, records telemetry +
+// the [shadow] toast, and always returns native (compaction: undefined).
 import { readFileSync } from "node:fs";
-import type { DecisionClient, DecisionQuestion } from "./client.ts";
+import type { DecisionBatch, DecisionClient, DecisionQuestion } from "./client.ts";
 import type { Action, BackendProfile, UnitType } from "./config.ts";
-import { estimateTextTokens, serializeUnit, splitUnits, type Unit } from "./units.ts";
+import { callsText, estimateTextTokens, serializeUnit, splitUnits, type Unit } from "./units.ts";
 
 export type { Action };
 
@@ -89,59 +89,194 @@ export function fillInstructions(template: string, unit: Unit): string {
 		.replaceAll("{resultChars}", String(unit.chars));
 }
 
-// ---------- shared state (SPEC §3.4, stage "full"; the fitting ladder is ticket 03) ----------
+// ---------- shared state + the state-fitting ladder (SPEC §3.4, fast-jev's 8 stages) ----------
 
 const FULL_TEXT_CAP = 2000; // stage "full": head stays inline, the tail becomes the size note
 const GOAL_PROMPTS = 5;
 const GOAL_PROMPT_CAP = 400;
 
-interface StateRegionEntry {
+export interface StateRegionEntry {
 	id: string;
 	type: string;
 	chars: number;
 	text: string;
 }
 
-interface DecisionState {
+export interface DecisionState {
 	orientation: string;
 	goal: string[];
 	region: StateRegionEntry[];
 }
+
+export type LadderStage =
+	| "full"
+	| "inputs<=1000"
+	| "inputs<=200"
+	| "inputs<=60"
+	| "abridged"
+	| "collapsed"
+	| "call-lines"
+	| "call-less-omitted"
+	| "merged-calls";
+
+/** Deepest rung of the ladder — recorded in telemetry when even it cannot fit. */
+const LAST_STAGE: LadderStage = "merged-calls";
 
 const ORIENTATION =
 	"A coding assistant conversation is being compacted. For each unit in the region below, choose the action " +
 	"that loses the least information needed to continue the work later: whatever is not kept is summarized or " +
 	"dropped, but the assistant can always re-run a tool or re-read a file.";
 
+const PINNED_TYPES = new Set(["user", "previous-summary", "unknown"]); // unknown is pinned policy too (SPEC §3.3)
+/** # ponytail: newest entries the ladder never touches; fast-jev's preserveRecentMessages=6 — revisit only if shadow telemetry shows recent-context misses */
+const RECENT_UNITS = 6;
+
+const ABRIDGE_HEAD = 400;
+const ABRIDGE_TAIL = 150;
+/** Abridging must save at least ~100 chars to be worth a stage. */
+const ABRIDGE_MIN_CHARS = ABRIDGE_HEAD + ABRIDGE_TAIL + 100;
+const CALL_LINE_ARG_CHARS = 60;
+
 function inlineText(unit: Unit): string {
 	if (unit.text.length <= FULL_TEXT_CAP) return unit.text;
 	return `${unit.text.slice(0, FULL_TEXT_CAP)}\n[... ${unit.chars} chars (omitted)]`;
-}
-
-function buildState(units: Unit[], goalPrompts: string[]): DecisionState {
-	return {
-		orientation: ORIENTATION,
-		goal: goalPrompts.slice(-GOAL_PROMPTS).map((p) => (p.length > GOAL_PROMPT_CAP ? `${p.slice(0, GOAL_PROMPT_CAP)}…` : p)),
-		region: units.map((u) => ({ id: u.id, type: u.type, chars: u.chars, text: inlineText(u) })),
-	};
 }
 
 function estimateStateTokens(state: DecisionState): number {
 	return estimateTextTokens(JSON.stringify(state));
 }
 
-/** Crude client-side pre-trim (clef profile): strip unit texts oldest-first, pinned types last. Never partial units. */
-function fitsAfterTrim(state: DecisionState, budgetTokens: number): DecisionState | null {
-	const pinned = new Set<string>(["user", "previous-summary", "unknown"]); // unknown is pinned policy too (SPEC §3.3)
-	const trimmed = state.region.map((r) => ({ ...r })); // oldest-first: the loop below iterates forward
-	let tokens = estimateStateTokens({ ...state, region: trimmed });
-	for (let i = 0; i < trimmed.length && tokens > budgetTokens; i++) {
-		if (pinned.has(trimmed[i].type)) continue;
-		trimmed[i] = { id: trimmed[i].id, type: trimmed[i].type, chars: trimmed[i].chars, text: `${trimmed[i].chars} chars (omitted)` };
-		tokens = estimateStateTokens({ ...state, region: trimmed });
+/** One working region entry: the rendered state text plus the unit it came from (stages re-render from the unit). */
+interface Ent extends StateRegionEntry {
+	unit: Unit;
+}
+
+/**
+ * Fit the shared state under `budgetTokens` through the ordered degradation ladder (SPEC §3.4);
+ * each stage applies to eligible entries oldest-first, one entry at a time, only advancing when
+ * the previous stage left the state over budget. Pinned and recent entries are never degraded.
+ * Returns null when even the final stage cannot fit — the caller falls back to native.
+ */
+export function fitState(units: Unit[], budgetTokens: number): { state: DecisionState; stage: LadderStage } | null {
+	let ents: Ent[] = units.map((u) => ({ id: u.id, type: u.type, chars: u.chars, text: inlineText(u), unit: u }));
+	const resultByCallId = new Map<string, Unit>();
+	const callOwner = new Map<string, Unit>();
+	for (const u of units) {
+		if (u.type === "tool-call") for (const c of u.calls ?? []) callOwner.set(c.id, u);
 	}
-	if (tokens > budgetTokens) return null;
-	return { ...state, region: trimmed };
+	for (const u of units) {
+		if (u.type !== "tool-result" || !u.toolCallId) continue;
+		if (callOwner.has(u.toolCallId)) resultByCallId.set(u.toolCallId, u);
+	}
+	const goalPrompts = units.filter((u) => u.type === "user").map((u) => u.text);
+
+	const build = (): DecisionState => ({
+		orientation: ORIENTATION,
+		goal: goalPrompts.slice(-GOAL_PROMPTS).map((p) => (p.length > GOAL_PROMPT_CAP ? `${p.slice(0, GOAL_PROMPT_CAP)}…` : p)),
+		region: ents.map(({ id, type, chars, text }) => ({ id, type, chars, text })),
+	});
+	const fits = (): boolean => estimateStateTokens(build()) <= budgetTokens;
+	if (fits()) return { state: build(), stage: "full" };
+
+	// Eligible for degradation: not pinned, not among the newest entries.
+	const eligible = (i: number): boolean => i < ents.length - RECENT_UNITS && !PINNED_TYPES.has(ents[i].type);
+
+	// Apply a per-entry transform oldest-first until the state fits; leave it applied when it doesn't
+	// (the next stage degrades further from here).
+	const tryStage = (transform: (e: Ent) => Ent | null): boolean => {
+		for (let i = 0; i < ents.length; i++) {
+			if (!eligible(i)) continue;
+			const t = transform(ents[i]);
+			if (!t) continue;
+			ents[i] = t;
+			if (fits()) return true;
+		}
+		return false;
+	};
+
+	const inputsCap = (cap: number) => (e: Ent): Ent | null => {
+		if (e.unit.type !== "tool-call") return null;
+		const text = callsText(e.unit.calls ?? [], cap);
+		return text === e.text ? null : { ...e, text };
+	};
+	const abridge = (e: Ent): Ent | null => {
+		// head+tail of the RAW unit text — the baseline render already capped it at FULL_TEXT_CAP
+		if (e.unit.type === "tool-call" || e.unit.text.length <= ABRIDGE_MIN_CHARS) return null;
+		const omitted = e.unit.text.length - ABRIDGE_HEAD - ABRIDGE_TAIL;
+		return { ...e, text: `${e.unit.text.slice(0, ABRIDGE_HEAD)}\n[… ${omitted} chars omitted …]\n${e.unit.text.slice(-ABRIDGE_TAIL)}` };
+	};
+	const collapse = (e: Ent): Ent | null => {
+		if (e.unit.type === "tool-call") return null; // calls get their own stage next
+		const text = `${e.chars} chars (omitted)`;
+		return text === e.text ? null : { ...e, text };
+	};
+
+	const stages: Array<[LadderStage, (e: Ent) => Ent | null]> = [
+		["inputs<=1000", inputsCap(1000)],
+		["inputs<=200", inputsCap(200)],
+		["inputs<=60", inputsCap(60)],
+		["abridged", abridge],
+		["collapsed", collapse],
+	];
+	for (const [stage, transform] of stages) {
+		if (tryStage(transform)) return { state: build(), stage };
+	}
+
+	// One-line old call summaries: fold each eligible old call with its eligible paired result
+	// into one line (`tool(args≤60) → Nch`), removing the separate result entry, oldest first.
+	// Only folded results are reported in the line and summed into chars — unfolded (e.g. recent)
+	// results keep their own entries.
+	for (let i = 0; i < ents.length; i++) {
+		const e = ents[i];
+		if (!eligible(i) || e.unit.type !== "tool-call") continue;
+		const resultIdxs: number[] = [];
+		for (const c of e.unit.calls ?? []) {
+			const j = ents.findIndex((x, k) => k > i && x.unit.type === "tool-result" && x.unit.toolCallId === c.id && eligible(k));
+			if (j > i) resultIdxs.push(j);
+		}
+		if (resultIdxs.length === 0) continue;
+		const foldedResults = new Map<string, Unit>();
+		let foldedChars = 0;
+		for (const k of resultIdxs) {
+			const r = ents[k];
+			foldedResults.set(r.unit.toolCallId ?? "", r.unit);
+			foldedChars += r.chars;
+		}
+		ents[i] = { ...e, text: callsText(e.unit.calls ?? [], CALL_LINE_ARG_CHARS, foldedResults), chars: e.chars + foldedChars };
+		for (const k of resultIdxs.sort((a, b) => b - a)) ents.splice(k, 1);
+		if (fits()) return { state: build(), stage: "call-lines" };
+	}
+
+	// Leave out old call-less messages (assistant text / thinking; user & summary are pinned), oldest first.
+	for (let i = 0; i < ents.length; ) {
+		const e = ents[i];
+		if (eligible(i) && e.unit.type !== "tool-call" && e.unit.type !== "tool-result") {
+			ents.splice(i, 1);
+			if (fits()) return { state: build(), stage: "call-less-omitted" };
+			continue;
+		}
+		i++;
+	}
+
+	// Merge runs of old call+result entries into one entry that lists every member id.
+	const isCallish = (e: Ent): boolean => e.unit.type === "tool-call" || e.unit.type === "tool-result";
+	for (let i = 0; i < ents.length - 1; i++) {
+		if (!eligible(i) || !isCallish(ents[i])) continue;
+		let j = i + 1;
+		while (j < ents.length && eligible(j) && isCallish(ents[j])) j++;
+		if (j - i < 2) continue;
+		const run = ents.slice(i, j);
+		const merged: Ent = {
+			id: run[0].id,
+			type: run[0].type,
+			chars: run.reduce((s, e) => s + e.chars, 0),
+			text: `${run.length} calls and results (${run.map((e) => e.id).join(", ")}): ${run.map((e) => e.text).join(" | ")}`,
+			unit: run[0].unit,
+		};
+		ents = [...ents.slice(0, i), merged, ...ents.slice(j)];
+		if (fits()) return { state: build(), stage: "merged-calls" };
+	}
+	return null;
 }
 
 // ---------- pipeline ----------
@@ -255,34 +390,23 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		}
 	}
 
-	// Chunk cap: batching lands in ticket 03; the overflow classifies keep, loudly in its reason.
-	const overflow = askable.slice(profile.maxQuestions);
-	for (const u of overflow) {
-		actions.set(u.id, { id: u.id, type: u.type, action: "keep", reason: `kept: over ${profile.maxQuestions}-question request cap (batching: ticket 03)` });
+	// Shared state through the fitting ladder; exhausted → native (rung 1, SPEC §3.4).
+	// The ladder is client-side for every backend — clef because it silently truncates
+	// over-limit state, jev because it would 400 — so truncateStateClientSide no longer
+	// gates here (ticket-02's crude trim was its placeholder).
+	const fitted = fitState(units, profile.stateTokenBudget);
+	if (!fitted) {
+		return finishFallback(
+			mkRecord(profile.model, LAST_STAGE),
+			1,
+			`state cannot fit budget ${profile.stateTokenBudget} even at the final ladder stage "${LAST_STAGE}"`,
+		);
 	}
-	const batch = askable.slice(0, profile.maxQuestions);
-
-	// Shared state; oversize that can't fit yet → native (the state-fitting ladder is ticket 03).
-	const goalPrompts = units.filter((u) => u.type === "user").map((u) => u.text);
-	let state = buildState(units, goalPrompts);
-	let stage = "full";
-	let stateTokens = estimateStateTokens(state);
-	if (stateTokens > profile.stateTokenBudget) {
-		if (!profile.truncateStateClientSide) {
-			return finishFallback(mkRecord(profile.model, stage), 1, `state ${stateTokens} tok exceeds budget ${profile.stateTokenBudget} and the backend truncates nothing (state-fitting ladder: ticket 03)`);
-		}
-		const trimmed = fitsAfterTrim(state, profile.stateTokenBudget);
-		if (!trimmed) {
-			return finishFallback(mkRecord(profile.model, stage), 1, `state ${stateTokens} tok cannot fit budget ${profile.stateTokenBudget} even truncated (state-fitting ladder: ticket 03)`);
-		}
-		state = trimmed;
-		stage = "client-truncated";
-		stateTokens = estimateStateTokens(state);
-	}
+	const { state, stage } = fitted;
 
 	// Questions: one choice per askable unit, candidates = the row's allowed subset.
-	const questions: Record<string, DecisionQuestion> = {};
-	for (const u of batch) {
+	const questionOf = new Map<string, DecisionQuestion>();
+	for (const u of askable) {
 		const row = opts.matrix[u.type as UnitType];
 		const tpl = deps.questionSet[u.type];
 		if (!tpl) {
@@ -295,28 +419,67 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 		}
 		const criteria: Record<string, string> = {};
 		for (const a of row) criteria[a] = ACTION_CRITERIA[a];
-		questions[u.id] = { type: "choice", instructions: fillInstructions(tpl.instructions, u), criteria };
+		questionOf.set(u.id, { type: "choice", instructions: fillInstructions(tpl.instructions, u), criteria });
 	}
+
+	// Chunk askables into concurrent batches (SPEC §3.4): ≤ profile.maxQuestions questions per
+	// batch and state + questions within the per-request token budget. The same state is resent
+	// with every batch; answers merge by question id. Questions too big for what the budget has
+	// left default to keep.
+	const questionBudget = Math.max(0, profile.stateTokenBudget - estimateStateTokens(state));
+	const batches: Unit[][] = [];
+	let current: Unit[] = [];
+	let currentTokens = 0;
+	for (const u of askable) {
+		const q = questionOf.get(u.id);
+		if (!q) continue;
+		const tokens = estimateTextTokens(JSON.stringify(q));
+		if (tokens > questionBudget) {
+			actions.set(u.id, { id: u.id, type: u.type, action: "keep", reason: `kept: question exceeds the ${questionBudget}-tok request budget left after the state (chunk cap)` });
+			continue;
+		}
+		if (current.length >= profile.maxQuestions || currentTokens + tokens > questionBudget) {
+			batches.push(current);
+			current = [];
+			currentTokens = 0;
+		}
+		current.push(u);
+		currentTokens += tokens;
+	}
+	if (current.length > 0) batches.push(current);
+	const askedIds = new Set(batches.flat().map((u) => u.id));
 
 	let decisionMs = 0;
 	let inputTokens = 0;
 	let rawAnswers: Record<string, unknown> = {};
-	if (Object.keys(questions).length > 0) {
-		const res = await deps.client.decide({ state, model: profile.model, questions }, region.signal);
+	if (batches.length > 0) {
+		const results = await Promise.all(
+			batches.map((batch) =>
+				deps.client.decide(
+					{ state, model: profile.model, questions: Object.fromEntries(batch.map((u) => [u.id, questionOf.get(u.id)!])) },
+					region.signal,
+				),
+			),
+		);
 		decisionMs = Date.now() - t0;
-		if (!res.ok) {
-			return finishFallback(mkRecord(profile.model, stage), res.error.rung, `${res.error.kind}: ${res.error.message}`);
+		// Any transport-class failure fails the run to native — no partial salvage across batches.
+		const failed = results.find((r): r is Extract<DecisionBatch, { ok: false }> => !r.ok);
+		if (failed) {
+			return finishFallback(mkRecord(profile.model, stage), failed.error.rung, `${failed.error.kind}: ${failed.error.message}`);
 		}
-		inputTokens = res.inputTokens;
-		rawAnswers = res.answers as Record<string, unknown>;
+		for (const r of results) {
+			if (!r.ok) continue;
+			inputTokens += r.inputTokens;
+			Object.assign(rawAnswers, r.answers);
+		}
 	} else {
 		decisionMs = Date.now() - t0;
 	}
 
 	// Map: argmax over probabilities ∩ row subset; floor escalates to keep (SPEC §3.5).
 	let validAnswers = 0;
-	for (const u of batch) {
-		if (!questions[u.id]) continue; // skipped by caps above
+	const questioned = askable.filter((u) => askedIds.has(u.id));
+	for (const u of questioned) {
 		const row = opts.matrix[u.type as UnitType];
 		const a = rawAnswers[u.id] as { type?: unknown; choice?: unknown; probabilities?: unknown; confidence?: unknown } | undefined;
 		const valid = !!a && a.type === "choice" && typeof a.choice === "string" && (row as string[]).includes(a.choice);
@@ -349,7 +512,7 @@ export async function runShadow(deps: ShadowDeps, opts: ShadowOpts, profile: Bac
 			actions.set(u.id, { id: u.id, type: u.type, action: chosen, confidence, probabilities: hasProb ? rowProbs : undefined, reason: `${PAST[chosen]}: ${chosen} ${confStr(confidence)}` });
 		}
 	}
-	if (batch.length > 0 && Object.keys(questions).length > 0 && validAnswers === 0) {
+	if (questioned.length > 0 && validAnswers === 0) {
 		return finishFallback(mkRecord(profile.model, stage), 2, "no valid answers in response (wholly unusable)");
 	}
 

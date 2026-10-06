@@ -49,11 +49,25 @@ function contentText(content: unknown): string {
 		.trim();
 }
 
-function argsText(args: unknown): string {
+/** Render call arguments as `k=v, …` — shared by unit splitting and the ladder's call-line stages. */
+export function argsText(args: unknown): string {
 	if (args === null || args === undefined || typeof args !== "object") return JSON.stringify(args) ?? "";
 	return Object.entries(args as Record<string, unknown>)
 		.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
 		.join(", ");
+}
+
+/** One-line rendering of a tool-call group: `name(args…)` per call, args capped with a size note; optional per-call result summary. */
+export function callsText(calls: ToolCallRef[], argCap = Infinity, resultByCallId?: Map<string, Unit>): string {
+	return calls
+		.map((c) => {
+			const args = argsText(c.arguments);
+			let line = `${c.name}(${argCap === Infinity || args.length <= argCap ? args : `${args.slice(0, argCap)}…(${args.length}ch)`})`;
+			const r = resultByCallId?.get(c.id);
+			if (r) line += ` → ${r.chars}ch${r.isError ? " (error)" : ""}`;
+			return line;
+		})
+		.join("; ");
 }
 
 /** Split the compaction region into decision units, oldest first. */
@@ -100,7 +114,8 @@ export function splitUnits(messages: Array<Record<string, unknown>>, previousSum
 					units.push({ id: `u_${i}_text`, type: "assistant-text", index: i, text, chars: text.length, kind: "assistant" });
 				}
 				if (calls.length > 0) {
-					units.push({ id: `u_${i}_call`, type: "tool-call", index: i, text: calls.map((c) => `${c.name}(${argsText(c.arguments)})`).join("; "), chars: 0, kind: "assistant", calls });
+					const callsLine = callsText(calls);
+					units.push({ id: `u_${i}_call`, type: "tool-call", index: i, text: callsLine, chars: callsLine.length, kind: "assistant", calls });
 				}
 				break;
 			}
