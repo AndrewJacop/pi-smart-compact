@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import type { DecisionBatch, DecisionRequest } from "../extensions/smart-compact/client.ts";
+import type { DecisionState } from "../extensions/smart-compact/pipeline.ts";
+
+/** The wire type carries `state: unknown`; tests below read the pipeline's state shape. */
+const stateOf = (r: DecisionRequest): DecisionState => r.state as DecisionState;
 import { DEFAULT_MATRIX, effectiveProfile, type ProfileOverride } from "../extensions/smart-compact/config.ts";
 import { fitState, loadQuestionSet, runShadow, type ShadowDeps } from "../extensions/smart-compact/pipeline.ts";
 import { estimateTextTokens, splitUnits } from "../extensions/smart-compact/units.ts";
@@ -196,36 +200,37 @@ test("transport failure (auth/timeout/500 shapes) → native at rung 1, exactly 
 	}
 });
 
-test("oversize state fits through the ladder when client-side truncation is on; exhaustion → native rung 1", async () => {
+test("oversize state fits through the ladder when client-side truncation is on; exhaustion → chunk-cap keeps", async () => {
 	const collected: unknown[] = [];
 	// pad so bulky units sit outside the recent window and the ladder has material to degrade
 	const padded = [...bigRegion(), ...Array.from({ length: 6 }, (_, i) => assistant([{ type: "text", text: `padding ${i}` }]))];
-	// small budget forces a degraded stage under the clef profile (truncate on)
+	// a budget the whole-region state would blow past, but each per-batch state fits degraded
 	collected.length = 0;
 	const capture: { requests?: DecisionRequest[] } = {};
-	const trimmed = await runShadow(deps(setupClient(REGION_ANSWERS, capture), collected), OPTS, profile({ stateTokenBudget: 600 }), {
+	const trimmed = await runShadow(deps(setupClient(REGION_ANSWERS, capture), collected), OPTS, profile({ stateTokenBudget: 1500 }), {
 		messages: padded,
 		kind: "compact",
 	});
 	assert.equal(trimmed.outcome, "shadowed");
 	const state = capture.requests?.[0]?.state as { region: { id: string; text?: string }[] };
 	const tokens = estimateTextTokens(JSON.stringify(state));
-	assert.ok(tokens <= 600, `fitted state ${tokens} tok should fit budget 600`);
+	assert.ok(tokens <= 1500, `fitted state ${tokens} tok should fit budget 1500`);
 	const stage = (collected[0] as { stage: string }).stage;
 	assert.notEqual(stage, "full");
 
-	// a budget below the pinned+recent floor exhausts the ladder → native at rung 1
+	// a budget below even one batch's pinned+recent floor exhausts the ladder → the batch
+	// defaults to keep (chunk cap), no request, no fallback — the gate stays the arbiter
 	collected.length = 0;
 	const exhausted = await runShadow(deps(setupClient(REGION_ANSWERS), collected), OPTS, profile({ stateTokenBudget: 5 }), {
 		messages: bigRegion(),
 		kind: "compact",
 	});
-	assert.equal(exhausted.outcome, "fallback");
-	const record = collected[0] as { fallback: { rung: number; error: string }; stage: string };
-	assert.equal(record.fallback.rung, 1);
-	assert.match(record.fallback.error, /ladder/);
+	assert.equal(exhausted.outcome, "shadowed");
+	const record = collected[0] as { fallback: { rung: number | null }; stage: string; units: { reason: string }[] };
+	assert.equal(record.fallback.rung, null);
 	assert.equal(record.stage, "merged-calls");
-});
+	assert.ok(record.units.every((u) => !/chunk cap/.test(u.reason) || u.reason.includes("cannot fit")));
+})
 
 test("shadow success: native entry path (undefined), toast, and a full telemetry record", async () => {
 	const collected: unknown[] = [];
@@ -268,7 +273,7 @@ test("empty region → nothing runs, nothing recorded", async () => {
 	assert.equal(capture.requests!.length, 0);
 });
 
-test("askables beyond the per-request cap chunk into concurrent batches sharing one state; answers merge by id", async () => {
+test("askables beyond the per-request cap chunk into concurrent batches, each with its own state; answers merge by id", async () => {
 	const messages = Array.from({ length: 30 }, (_, i) => assistant([{ type: "text", text: `msg ${i}` }]));
 	const capture: { requests: DecisionRequest[]; calls: number } = { requests: [], calls: 0 };
 	const pending: Array<{ resolve: (b: DecisionBatch) => void; req: DecisionRequest }> = [];
@@ -284,9 +289,19 @@ test("askables beyond the per-request cap chunk into concurrent batches sharing 
 	await new Promise((r) => setImmediate(r));
 	// all three batches fired concurrently — none awaited serially
 	assert.equal(capture.calls, 3);
-	// the same state object is resent with every batch
-	assert.ok(capture.requests[0].state === capture.requests[1].state);
-	assert.ok(capture.requests[1].state === capture.requests[2].state);
+	// per-batch states: each request's region covers exactly its own questions' units, and the
+	// orientation + goal (shared context) are identical across batches
+	for (const r of capture.requests) {
+		const st = stateOf(r);
+		assert.equal(st.region.length, Object.keys(r.questions).length, "the roll-call carries only this batch's units");
+		assert.deepEqual(
+			new Set(st.region.map((e) => e.id)),
+			new Set(Object.keys(r.questions)),
+			"region ids == question ids (no starvation, no foreign units)",
+		);
+		assert.equal(st.orientation, stateOf(capture.requests[0]).orientation);
+		assert.deepEqual(st.goal, stateOf(capture.requests[0]).goal);
+	}
 	const ids = capture.requests.map((r) => Object.keys(r.questions).sort());
 	for (const r of ids) assert.equal(r.length, 10);
 	const union = new Set(ids.flat());
@@ -327,21 +342,37 @@ test("a batch-level transport failure fails the whole run to native at rung 1", 
 	assert.equal((collected[0] as { fallback: { rung: number } }).fallback.rung, 1);
 });
 
-test("a question too big for the request budget left after the state classifies keep with a reason", async () => {
-	// budget = exactly the fitted state's size: nothing left for questions, so every askable defaults to keep
+test("a request budget too small for even one batch's state classifies keep with a reason", async () => {
+	// budget 50 tok: the per-batch state cannot fit even at the final ladder stage, so the batch
+	// defaults to keep (chunk cap) — 0 requests, no starvation crash, the gate stays the arbiter
 	const messages = [user("goal"), assistant([{ type: "text", text: "only askable" }])];
 	const capture: { requests: DecisionRequest[]; calls: number } = { requests: [], calls: 0 };
-	const fitted = fitState(splitUnits(messages, undefined), 10_000)!;
-	const budget = estimateTextTokens(JSON.stringify(fitted.state)); // exactly the state's size
 	const collected: unknown[] = [];
-	const result = await runShadow(deps(setupClient({}, capture), collected), OPTS, profile({ stateTokenBudget: budget }), { messages, kind: "compact" });
+	const result = await runShadow(deps(setupClient({}, capture), collected), OPTS, profile({ stateTokenBudget: 50 }), { messages, kind: "compact" });
 	assert.equal(result.outcome, "shadowed");
-	assert.equal(capture.calls, 0, "no request when nothing fits the chunk cap");
+	assert.equal(capture.calls, 0, "no request when the batch state cannot fit");
 	const record = collected[0] as { units: { id: string; type: string; action: string; reason: string }[] };
 	const unit = record.units.find((u) => u.type === "assistant-text");
 	assert.ok(unit);
 	assert.equal(unit.action, "keep");
 	assert.match(unit.reason, /budget|chunk cap/);
+});
+
+// ---- regression (2026-10-07 e2e finding): a large region must never starve the question budget ----
+// The one-shared-state design filled clef's entire request budget with a 451-unit roll-call and
+// silently asked nothing; per-batch states keep every askable asked regardless of region size.
+test("a 200-unit region asks every askable across batches — zero chunk-cap keeps", async () => {
+	const messages = Array.from({ length: 200 }, (_, i) => assistant([{ type: "text", text: `msg ${i}: ${filler(30, `m${i}`)}` }]));
+	const capture: { requests?: DecisionRequest[]; calls?: number } = {};
+	const collected: unknown[] = [];
+	const result = await runShadow(deps(echoClient(capture), collected), OPTS, profile(), { messages, kind: "compact" });
+	assert.equal(result.outcome, "shadowed");
+	const asked = new Set(capture.requests!.flatMap((r) => Object.keys(r.questions)));
+	assert.equal(asked.size, 200, "every askable asked");
+	assert.ok(capture.requests!.every((r) => Object.keys(r.questions).length <= 64), "batches respect the backend's per-request question cap");
+	assert.ok(capture.requests!.every((r) => stateOf(r).region.length === Object.keys(r.questions).length), "each state covers only its own batch");
+	const record = collected[0] as { units: { id: string; type: string; action: string; reason: string }[] };
+	assert.ok(record.units.filter((u) => u.type === "assistant-text").every((u) => !/chunk cap/.test(u.reason)), "no starvation keeps");
 });
 
 // ---- the ~42k-token spike fixture region (SPEC §11 fixture, ticket 03 acceptance) ----
@@ -435,20 +466,20 @@ test("the ~42k-token spike fixture region makes shadow decisions in one run, lad
 	assert.notEqual(squeezedStage, "full", "the ladder engaged for the fixture under a tight budget");
 });
 
-test("a small leftover budget splits into one-question batches; every askable still asked", async () => {
-	// the token dimension of chunking: state fills most of the budget, so each batch
-	// carries ~one question — more requests, same total questions, nothing silently kept
+test("a tight-but-sufficient budget asks everything in one batch — nothing starved", async () => {
+	// the token dimension of chunking is now per-batch: the batch state covers only its own
+	// units, so even a budget barely above the full state still asks every askable
 	const messages = [user("goal"), ...Array.from({ length: 6 }, (_, i) => assistant([{ type: "text", text: `msg ${i}: ${filler(30, `m${i}`)}` }]))];
 	const units = splitUnits(messages, undefined);
 	const fullState = fitState(units, Number.MAX_SAFE_INTEGER)!.state;
 	const fullTokens = estimateTextTokens(JSON.stringify(fullState));
-	// measure real per-question size from an unbounded run
+	// measure real per-question sizes from an unbounded run
 	const bigCapture: { requests?: DecisionRequest[]; calls?: number } = {};
 	const answers = Object.fromEntries(units.filter((u) => u.type === "assistant-text").map((u) => [u.id, { type: "choice", choice: "keep", confidence: 0.9 }]));
 	await runShadow(deps(setupClient(answers, bigCapture), []), OPTS, profile(), { messages, kind: "compact" });
-	const perQuestion = Object.values(bigCapture.requests![0].questions).map((q) => estimateTextTokens(JSON.stringify(q)));
-	const smallest = Math.min(...perQuestion);
-	const budget = fullTokens + smallest; // room for exactly one question per request
+	const questionTokens = Object.values(bigCapture.requests![0].questions).reduce((s, q) => s + estimateTextTokens(JSON.stringify(q)), 0);
+	// one token below state + all questions: the per-batch state (no user roll-call entry) still fits
+	const budget = fullTokens + questionTokens - 1;
 	const capture: { requests?: DecisionRequest[]; calls?: number } = {};
 	const collected: unknown[] = [];
 	const result = await runShadow(deps(setupClient(answers, capture), collected), OPTS, profile({ stateTokenBudget: budget, maxQuestions: 64 }), {
@@ -456,9 +487,9 @@ test("a small leftover budget splits into one-question batches; every askable st
 		kind: "compact",
 	});
 	assert.equal(result.outcome, "shadowed");
-	assert.equal(capture.calls, 6, "one request per question");
+	assert.equal(capture.calls, 1, "all six askables fit one per-batch state");
 	const asked = new Set(capture.requests!.flatMap((r) => Object.keys(r.questions)));
-	assert.equal(asked.size, 6, "every askable still asked across batches");
+	assert.equal(asked.size, 6, "every askable asked");
 	const record = collected[0] as { units: { id: string; type: string; action: string; reason: string }[] };
 	assert.ok(record.units.filter((x) => x.type === "assistant-text").every((u) => u.action === "keep" && /^kept: keep/.test(u.reason)));
 });
@@ -538,7 +569,8 @@ test("jev-direct: no client-side truncation — oversize state still ships and t
 	assert.equal(record.fallback.rung, 1);
 	assert.match(record.fallback.error, /input_too_large/);
 
-	// the identical budget WITH client-side truncation → ladder exhaustion → native with NO request
+	// the identical budget WITH client-side truncation: the batch state cannot fit at budget 100,
+	// so the batch defaults to keep (chunk cap) — no request, no fallback, the gate stays the arbiter
 	let truncCalls = 0;
 	const collected2: unknown[] = [];
 	await runShadow(
@@ -552,9 +584,11 @@ test("jev-direct: no client-side truncation — oversize state still ships and t
 		effectiveProfile("jev-direct", { ...tinyBudget, truncateStateClientSide: true }),
 		{ messages: bigRegion(), kind: "compact" },
 	);
-	assert.equal(truncCalls, 0, "ladder exhaustion fails native before any request");
-	assert.equal((collected2[0] as { fallback: { rung: number } }).fallback.rung, 1);
+	assert.equal(truncCalls, 0, "batch-state exhaustion asks nothing");
+	assert.equal((collected2[0] as { fallback: { rung: number } }).fallback.rung, null, "chunk-cap keeps are not a fallback");
 	assert.equal((collected2[0] as { stage: string }).stage, "merged-calls");
+	const kept2 = (collected2[0] as { units: { reason: string }[] }).units.every((u) => !/chunk cap/.test(u.reason) || u.reason.includes("cannot fit"));
+	assert.ok(kept2, "kept units carry the exhaustion reason");
 });
 
 test("jev-direct ships the full-stage state and never clamps questions by the budget", async () => {

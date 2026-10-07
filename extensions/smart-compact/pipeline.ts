@@ -157,9 +157,18 @@ interface Ent extends StateRegionEntry {
  * each stage applies to eligible entries oldest-first, one entry at a time, only advancing when
  * the previous stage left the state over budget. Pinned and recent entries are never degraded.
  * Returns null when even the final stage cannot fit — the caller falls back to native.
+ *
+ * `only` restricts the region roll-call to one batch's units (per-batch states, SPEC §3.4 as
+ * revised 2026-10): the request then carries that batch's units only, plus the orientation and
+ * the user-goal prompts, which still span the WHOLE region. Without it the roll-call grows with
+ * the unit count and starves the question budget on large regions — a 451-unit region filled
+ * clef's entire request budget by itself and every unit silently defaulted to keep (2026-10-07
+ * e2e finding, OPTOLINK import). Omitted → the whole-region state, as before.
  */
-export function fitState(units: Unit[], budgetTokens: number): { state: DecisionState; stage: LadderStage } | null {
-	let ents: Ent[] = units.map((u) => ({ id: u.id, type: u.type, chars: u.chars, text: inlineText(u), unit: u }));
+export function fitState(units: Unit[], budgetTokens: number, only?: ReadonlySet<string>): { state: DecisionState; stage: LadderStage } | null {
+	let ents: Ent[] = units
+		.filter((u) => !only || only.has(u.id))
+		.map((u) => ({ id: u.id, type: u.type, chars: u.chars, text: inlineText(u), unit: u }));
 	const resultByCallId = new Map<string, Unit>();
 	const callOwner = new Map<string, Unit>();
 	for (const u of units) {
@@ -418,24 +427,22 @@ export async function decideRegion(
 		}
 	}
 
-	// Shared state through the fitting ladder (SPEC §3.4) — client-side truncation is per-profile
-	// policy (§5.2): clef-family + freejev fit the budget client-side (clef silently truncates
-	// over-limit state, freejev's 128 KB body would 400); jev-direct ships the full-stage state
-	// and lets the API enforce size — its 400 surfaces as the rung-1 fallback below. Exhausted
-	// ladder → native (rung 1). One resolved budget feeds both the ladder and the chunk clamp.
+	// Per-batch state (SPEC §3.4, revised 2026-10). Each request's state covers only its own
+	// units, plus the orientation and user-goal prompts which still span the whole region; the
+	// one-shared-state design starved the question budget on large regions (see fitState). The
+	// ladder still fits each request client-side per profile policy (§5.2): clef-family + freejev
+	// fit state + questions under the per-request budget; jev-direct ships full-stage per-batch
+	// state and lets the API enforce size (its 400 → rung 1). A batch whose state cannot fit even
+	// at the final ladder stage defaults its units to keep (chunk cap) — the reduction gate, not
+	// destructiveness, decides what that does. Privacy (§10): every request's state and questions
+	// go through redactUnlessFull before the wire; the per-request idempotency key (§8.4) hashes
+	// the redacted body inside the client, as before.
 	const tokenBudget = profile.truncateStateClientSide ? profile.stateTokenBudget : Number.POSITIVE_INFINITY;
-	const fitted = fitState(units, tokenBudget);
-	if (!fitted) {
-		return {
-			ok: false,
-			rung: 1,
-			error: `state cannot fit budget ${profile.stateTokenBudget} even at the final ladder stage "${LAST_STAGE}"`,
-			model: profile.model,
-			stage: LAST_STAGE,
-			decisionMs: Date.now() - t0,
-		};
-	}
-	const { state, stage } = fitted;
+	// Gateway body caps are in BYTES, not tokens (clef's optollm: "request body must not exceed
+	// 64 KiB", HTTP 413, measured 2026-10-07) — the token budget (~chars/4 ≈ bytes) never saw
+	// them. Convert to a token ceiling with 10% envelope headroom; the per-batch fit then
+	// guarantees state + questions land under it.
+	const bodyTokCap = profile.maxBodyBytes ? Math.floor((profile.maxBodyBytes * 0.9) / 4) : Number.POSITIVE_INFINITY;
 
 	// Questions: one choice per askable unit, candidates = the row's allowed subset.
 	const questionOf = new Map<string, DecisionQuestion>();
@@ -455,59 +462,56 @@ export async function decideRegion(
 		questionOf.set(u.id, { type: "choice", instructions: fillInstructions(tpl.instructions, u), criteria });
 	}
 
-	// Privacy (SPEC §10): the whole egress (state + questions) goes through redactUnlessFull
-	// ONCE, before budgeting — every batch then resends the SAME redacted state object (answers
-	// merge by id), budgets see egress-faithful sizes, and ticket-08's idempotency-key content
-	// hash (§8.4) derives post-redaction. The helper copies; raw pipeline objects stay untouched.
-	// (The ladder truncates raw text; redaction only shrinks — the redacted state still fits.)
-	const egressState = redactUnlessFull(opts.privacy, state);
-	const egressQuestions = redactUnlessFull(opts.privacy, Object.fromEntries(questionOf));
+	const askableQ = askable.filter((u) => questionOf.has(u.id));
+	const batches: Unit[][] = [];
+	for (let i = 0; i < askableQ.length; i += profile.maxQuestions) batches.push(askableQ.slice(i, i + profile.maxQuestions));
 
-	// Chunk askables into concurrent batches (SPEC §3.4): ≤ profile.maxQuestions questions per
-	// batch and state + questions within the per-request token budget. The same state is resent
-	// with every batch; answers merge by question id. Without client truncation (jev-direct)
-	// there is no client-side size clamp at all — only maxQuestions chunks; the API enforces
-	// size and its 400 falls back at rung 1. Questions too big for the budget left default to keep.
-	const questionBudget = profile.truncateStateClientSide
-		? Math.max(0, tokenBudget - estimateStateTokens(egressState))
-		: tokenBudget; // no client truncation (jev-direct): no client-side size clamp, the API enforces
-	const batches: Unit[][] = []; // (chunking detail unchanged from ticket 02)
-	let current: Unit[] = [];
-	let currentTokens = 0;
-	for (const u of askable) {
-		const q = egressQuestions[u.id];
-		if (!q) continue;
-		const tokens = estimateTextTokens(JSON.stringify(q));
-		if (tokens > questionBudget) {
-			actions.set(u.id, { id: u.id, type: u.type, action: "keep", reason: `kept: question exceeds the ${questionBudget}-tok request budget left after the state (chunk cap)` });
-			continue;
+	const STAGE_ORDER: LadderStage[] = ["full", "inputs<=1000", "inputs<=200", "inputs<=60", "abridged", "collapsed", "call-lines", "call-less-omitted", "merged-calls"];
+	const deeper = (a: LadderStage, b: LadderStage): LadderStage => (STAGE_ORDER.indexOf(a) >= STAGE_ORDER.indexOf(b) ? a : b);
+
+	const prepared = batches.map((batch) => {
+		const questions: Record<string, DecisionQuestion> = {};
+		for (const u of batch) {
+			const q = questionOf.get(u.id);
+			if (!q) continue; // unreachable: askableQ is filtered by questionOf.has
+			questions[u.id] = redactUnlessFull(opts.privacy, q);
 		}
-		if (current.length >= profile.maxQuestions || currentTokens + tokens > questionBudget) {
-			batches.push(current);
-			current = [];
-			currentTokens = 0;
-		}
-		current.push(u);
-		currentTokens += tokens;
+		const questionTokens = Object.values(questions).reduce((s, q) => s + estimateTextTokens(JSON.stringify(q)), 0);
+		return { batch, questions, fitted: fitState(units, Math.min(tokenBudget, bodyTokCap) - questionTokens, new Set(batch.map((u) => u.id))) };
+	});
+	for (const p of prepared) {
+		if (p.fitted) continue;
+		for (const u of p.batch)
+			actions.set(u.id, { id: u.id, type: u.type, action: "keep", reason: `kept: state cannot fit the ${profile.stateTokenBudget}-tok request budget even at the final ladder stage "${LAST_STAGE}" (chunk cap)` });
 	}
-	if (current.length > 0) batches.push(current);
-	const askedIds = new Set(batches.flat().map((u) => u.id));
+	const fired = prepared.filter((p): p is typeof p & { fitted: { state: DecisionState; stage: LadderStage } } => !!p.fitted);
+	const stage: LadderStage | "n/a" = fired.length > 0 ? fired.map((p) => p.fitted.stage).reduce(deeper) : batches.length > 0 ? LAST_STAGE : "n/a";
 
 	let decisionMs = 0;
 	let inputTokens = 0;
 	let rawAnswers: Record<string, unknown> = {};
-	if (batches.length > 0) {
-		const results = await Promise.all(
-			batches.map((batch) =>
-				deps.client.decide(
-					{ state: egressState, model: profile.model, questions: Object.fromEntries(batch.map((u) => [u.id, egressQuestions[u.id]!])) },
-					region.signal,
+	if (fired.length > 0) {
+		// Batches fire in concurrent waves (measured 2026-10-07: 4-wide ≈ 12 s vs 9 s single — the
+		// gateway queues mildly at 4, badly wider). A failing wave aborts before launching more:
+		// still "no partial salvage", just no wasted requests after a known failure.
+		const WAVE = 4;
+		const results: DecisionBatch[] = [];
+		let failed: Extract<DecisionBatch, { ok: false }> | undefined;
+		for (let w = 0; w < fired.length && !failed; w += WAVE) {
+			const wave = fired.slice(w, w + WAVE);
+			const settled = await Promise.all(
+				wave.map((p) =>
+					deps.client.decide(
+						{ state: redactUnlessFull(opts.privacy, p.fitted.state), model: profile.model, questions: p.questions },
+						region.signal,
+					),
 				),
-			),
-		);
+			);
+			results.push(...settled);
+			failed = settled.find((r): r is Extract<DecisionBatch, { ok: false }> => !r.ok);
+		}
 		decisionMs = Date.now() - t0;
 		// Any transport-class failure fails the run to native — no partial salvage across batches.
-		const failed = results.find((r): r is Extract<DecisionBatch, { ok: false }> => !r.ok);
 		if (failed) {
 			return { ok: false, rung: failed.error.rung, error: `${failed.error.kind}: ${failed.error.message}`, model: profile.model, stage, decisionMs };
 		}
@@ -519,6 +523,7 @@ export async function decideRegion(
 	} else {
 		decisionMs = Date.now() - t0;
 	}
+	const askedIds = new Set(fired.flatMap((p) => p.batch.map((u) => u.id)));
 
 	// Map: argmax over probabilities ∩ row subset; floor escalates to keep (SPEC §3.5).
 	let validAnswers = 0;

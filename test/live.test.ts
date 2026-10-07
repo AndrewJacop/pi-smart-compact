@@ -352,9 +352,10 @@ test("shell live mode: persisted compaction result + info toast; telemetry with 
 
 			assert.ok(result && typeof result === "object" && "compaction" in result && result.compaction, "compaction returned for pi to persist");
 			assert.ok(capture.summarizeCalls[0].opts && String((capture.summarizeCalls[0].opts as { customInstructions: string }).customInstructions).includes("focus on the parser"));
-			// The union region reached the pipeline: prefix user unit is present in the state.
-			const state = capture.requests![0].state as { region: { id: string; text: string }[] };
-			assert.ok(state.region.some((e) => e.text === "prefix prompt"));
+			// The union region reached the pipeline: the prefix user unit feeds the state's goal
+			// (goal spans the whole region; region roll-calls are per-batch and askables-only).
+			const state = capture.requests![0].state as { goal: string[] };
+			assert.ok(state.goal.some((g) => g.includes("prefix prompt")));
 			assert.ok(result.compaction.summary.includes("[User]: prefix prompt"));
 			assert.ok(calls.length >= 1 && String(calls[0][0]).startsWith("smart-compact: kept "));
 			assert.equal(calls[0][1], "info");

@@ -23,6 +23,7 @@ export interface ProfileOverride {
 	model?: string;
 	maxQuestions?: number;
 	stateTokenBudget?: number;
+	maxBodyBytes?: number;
 	truncateStateClientSide?: boolean;
 	confidenceFloor?: number;
 }
@@ -41,7 +42,10 @@ export interface SmartCompactConfig {
 
 export const DEFAULT_BACKEND = "clef";
 export const DEFAULT_MIN_REDUCTION_PCT = 50;
-export const DEFAULT_DECISION_TIMEOUT_MS = 5000;
+/** Shipped default raised 5000 → 30000 (measured 2026-10-07): clef needs ~9–12 s per realistic
+ *  32-question batch (~13k server-counted tokens), so 5 s turned every non-trivial region into a
+ *  rung-1 fallback. 30 s matches what ticket 09's validation runs actually used. */
+export const DEFAULT_DECISION_TIMEOUT_MS = 30000;
 
 /** The Safe table (SPEC §4): rows the user's matrix may override per row. */
 export const DEFAULT_MATRIX: Record<UnitType, Action[]> = {
@@ -67,6 +71,9 @@ export interface BackendProfile {
 	model: string;
 	maxQuestions: number;
 	stateTokenBudget: number;
+	/** Hard request-body cap in bytes, when the gateway enforces one (clef's 64 KiB measured 2026-10-07).
+	 *  The fitter converts it to a token ceiling (~bytes/4) below the token budget; null/undefined = server enforces. */
+	maxBodyBytes?: number;
 	truncateStateClientSide: boolean;
 	confidenceFloor: number;
 	/** Backend candidate-count caps for choice questions (clef/optollm enforces 2–26). */
@@ -79,8 +86,9 @@ export const BACKEND_PROFILES: Record<string, BackendProfile> = {
 	clef: {
 		endpoint: "https://optollm.optomatica.com/v1/systemone",
 		model: "clef",
-		maxQuestions: 64,
-		stateTokenBudget: 25000,
+		maxQuestions: 32, // balance vs the context ceiling: 64 × ~155-tok questions ≈ 9.9k would eat the whole request, starving the state roll-call (measured 2026-10-07)
+		stateTokenBudget: 10000, // measured 2026-10-07: clef's context ≈ 16.5k server-counted tokens (7.5k-state prompt 400s, 7k passes at 16,179). The ceiling is on OUR chars/4 estimate; real content (code, JSON) tokenizes ≈1.2–1.35× denser and server adds ≈2.15k — 10k est ⇒ ≈13–13.5k real, ~3k headroom. 13k est straddled the line and 400'd on real content.
+		maxBodyBytes: 65536, // optollm gateway: "request body must not exceed 64 KiB" (413, measured 2026-10-07)
 		truncateStateClientSide: true, // clef silently truncates over-limit state — pre-trim (SPEC §5.2)
 		confidenceFloor: 0.1, // shared floor (SPEC §8.5)
 		candidatesMin: 2,
@@ -91,6 +99,7 @@ export const BACKEND_PROFILES: Record<string, BackendProfile> = {
 		model: "typesafe/jev-1.13-20260917", // pinned server-side; the adapter omits it from the request
 		maxQuestions: 16, // ≤ 16 questions/req; hard 1 req/min on this key — smoke tests only
 		stateTokenBudget: 24000, // 128 KB body cap (state + questions + envelope ≈ 32k tok)
+		maxBodyBytes: 131072, // 128 KB body (SPEC §5.2)
 		truncateStateClientSide: true, // a 128 KB oversize body is a guaranteed 400 — fit it client-side
 		confidenceFloor: 0.1,
 		candidatesMin: 2,
@@ -126,6 +135,7 @@ export function effectiveProfile(backend: string, override: ProfileOverride | un
 	if (override?.model !== undefined) p.model = override.model;
 	if (override?.maxQuestions !== undefined) p.maxQuestions = override.maxQuestions;
 	if (override?.stateTokenBudget !== undefined) p.stateTokenBudget = override.stateTokenBudget;
+	if (override?.maxBodyBytes !== undefined) p.maxBodyBytes = override.maxBodyBytes;
 	if (override?.truncateStateClientSide !== undefined) p.truncateStateClientSide = override.truncateStateClientSide;
 	if (override?.confidenceFloor !== undefined) p.confidenceFloor = override.confidenceFloor;
 	return p;
@@ -137,6 +147,7 @@ const PROFILE_FIELDS: Record<string, "string" | "int" | "boolean" | "floor"> = {
 	model: "string",
 	maxQuestions: "int",
 	stateTokenBudget: "int",
+	maxBodyBytes: "int",
 	truncateStateClientSide: "boolean",
 	confidenceFloor: "floor",
 };
