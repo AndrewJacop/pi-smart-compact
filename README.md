@@ -17,6 +17,8 @@ A [pi](https://github.com/earendil-works/pi) extension that replaces native comp
 9. [Eval results](#9-eval-results)
 10. [Limitations & v2](#10-limitations--v2)
 11. [Calibration recipe](#11-calibration-recipe)
+12. [How it compares](#12-how-it-compares)
+13. [License](#13-license)
 
 ## 1. What it is
 
@@ -31,7 +33,7 @@ pi's native compaction asks one LLM to summarize the whole conversation. That wo
 
 The newest N messages (`keptMessages`) are exempt from every decision and always survive verbatim. Failures at any step fall through a ladder to native compaction, so smart compaction is never worse than native.
 
-No commands, no new slash-verbs: install it, set one env var, optionally tune `smartCompact` in settings.json. It runs on pi's own compaction trigger.
+No commands, no new slash-verbs: install it, set one env var, optionally tune `smartCompact` in settings.json. It runs on pi's own compaction trigger. How this differs from the other compaction packages is in [§12](#12-how-it-compares).
 
 ## 2. Quickstart
 
@@ -272,3 +274,27 @@ mv ~/.pi/agent/smart-compact/telemetry.jsonl ~/.pi/agent/smart-compact/telemetry
 ```
 
 **`minReductionPct` stays 50, shared across backends.** Per-backend reduction tuning was data-rejected: the backend moved reduction by 0.2 pp; the driver is the matrix × the transcript. Recalibrate it only if your telemetry ever shows a nonzero below-bar (rung 4) rate.
+
+## 12. How it compares
+
+pi's own compaction is the baseline: one LLM prose summary over the whole region. It's simple and always available — but exact details (tool outputs, decisions, file paths) survive only if the summary prose happens to carry them. This package exists to keep those details on purpose.
+
+**vs `pi-jev-compaction`** (and the `fast-jev-compaction` family it comes from) — the closest relative. Both replace native compaction with a decision model and both fail soft to pi's native summary, so neither is ever worse than native. The differences:
+
+- **Backends.** They run on TypeSafe's hosted Jev only. This package ships four backends on one wire adapter — hosted **Clef** (default), **freejev**, **jev-direct**, and **self-hosted Ollama** for no-key/local use — and the backend is one settings row.
+- **Three actions, and a targeted summarizer.** Their decisions are keep / drop / truncate. This package decides **keep / summarize / drop** and runs an LLM over *only* the summarize class: big-but-boring outputs become prose instead of riding verbatim (expensive) or being truncated (lossy), while exact wording survives only where it matters.
+- **The matrix is the config.** Decisions are per unit type — assistant thinking, assistant text, tool calls, tool results, user messages, prior summaries — and each row's allowed actions are user-editable. Tool-output scoring isn't a fixed rule here; it's the default row of a table you can change.
+- **`keptMessages` clamp.** The newest N messages are exempt from every decision, guaranteed verbatim, by moving pi's cut point — on top of pi's own token-window behavior.
+- **Branch summaries.** `/tree` navigations with summaries run the same pipeline (same matrix, same gate), labeled `smart-compact` so they're attributable.
+- **Privacy by default.** All egress — decision state *and* summarizer input — passes pattern redaction (keys, bearer headers, PEM blocks, credential assignments) unless you opt into `full`.
+- **Calibration data.** Every run appends a JSONL telemetry record (per-unit decisions with confidence/probabilities/reason, stage, reduction, latency, usage) so thresholds are tunable from evidence, plus a docs-only recipe for tuning `confidenceFloor`.
+
+Shared by design: no commands, no extra slash-verbs, and the same fail-open rule — any failure returns pi's native compaction untouched.
+
+**Honest limitations we share with the whole family:** decisions are single-fixture-validated per backend, pattern redaction is never complete (obfuscated secrets slip through), and compaction latency is bounded by the decision backend (tens of seconds on very large regions). See [§10](#10-limitations--v2) for the full list and what's deliberately out of scope for v1.
+
+**Why the scoped name:** bare `pi-smart-compact` on npm belongs to an unrelated package; the scoped `@andrewjacop/pi-smart-compact` keeps the title and avoids the collision.
+
+## 13. License
+
+[MIT](./LICENSE) — © 2026 Andrew Jacop.

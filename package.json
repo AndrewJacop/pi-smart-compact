@@ -2,8 +2,31 @@
 	"name": "@andrewjacop/pi-smart-compact",
 	"version": "0.1.0",
 	"description": "Decision-model compaction for pi: a decision backend classifies each compactable message keep/summarize/drop, a targeted LLM summarizes only the summarize class, and any failure falls back to native compaction.",
+	"license": "MIT",
+	"author": "Andrew Jacop",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/andrewjacop/pi-smart-compact.git"
+	},
+	"homepage": "https://github.com/andrewjacop/pi-smart-compact#readme",
+	"bugs": {
+		"url": "https://github.com/andrewjacop/pi-smart-compact/issues"
+	},
 	"type": "module",
-	"keywords": ["pi-package"],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"compaction",
+		"context-window",
+		"summarization",
+		"jev",
+		"clef",
+		"llm"
+	],
 	"files": ["extensions"],
 	"scripts": {
 		"test": "node --test test/*.test.ts",
