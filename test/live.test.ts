@@ -325,6 +325,11 @@ test("keptRegionTokens estimates the entries pi keeps outside the compaction ent
 import { run } from "../extensions/smart-compact/index.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+/** Deferred toasts (§8.2, post-rebuild) land on a macrotask — flush before asserting. */
+function tick(ms = 20) {
+	return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 test("shell live mode: persisted compaction result + info toast; telemetry with live usage", async () => {
 	useKey();
 	try {
@@ -357,6 +362,7 @@ test("shell live mode: persisted compaction result + info toast; telemetry with 
 			const state = capture.requests![0].state as { goal: string[] };
 			assert.ok(state.goal.some((g) => g.includes("prefix prompt")));
 			assert.ok(result.compaction.summary.includes("[User]: prefix prompt"));
+			await tick();
 			assert.ok(calls.length >= 1 && String(calls[0][0]).startsWith("smart-compact: kept "));
 			assert.equal(calls[0][1], "info");
 			assert.ok(!String(calls[0][0]).includes("[shadow]"), "no shadow tag on live toasts");

@@ -194,6 +194,11 @@ test("live run with keptMessages: cut clamps earlier, exempt tail never asked, r
 	}
 });
 
+/** Deferred toasts (§8.2, post-rebuild) land on a macrotask — flush before asserting. */
+function tick(ms = 20) {
+	return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 test("live run with keptMessages ≥ session length: clean cancel, warn, on manual and keyless paths alike", async () => {
 	const entries = clampEntries();
 	// With key (manual /compact path): {cancel:true} → pi throws "Compaction cancelled".
@@ -205,6 +210,7 @@ test("live run with keptMessages ≥ session length: clean cancel, warn, on manu
 		const r = await liveRun(h, liveEvent(entries, "e3"));
 		assert.deepEqual(r, { cancel: true });
 		assert.equal(h.requests.length, 0, "no decision call");
+		await tick();
 		assert.equal(h.calls.length, 1);
 		assert.match(String(h.calls[0][0]), /keptMessages 99/);
 		assert.equal(h.calls[0][1], "warning");

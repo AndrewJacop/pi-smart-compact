@@ -50,6 +50,11 @@ test("registers both compaction hooks plus session_start", () => {
 	assert.ok(handlers.session_start, "session_start registered");
 });
 
+/** Deferred toasts (§8.2, post-rebuild) land on a macrotask — flush before asserting. */
+function tick(ms = 20) {
+	return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 test("no config + key present: native, silent (indistinguishable from native)", async () => {
 	savedKey = process.env[ENV_KEY];
 	process.env[ENV_KEY] = "sk-test";
@@ -64,6 +69,7 @@ test("no config + missing key: native + one warn naming the env var", async () =
 	delete process.env[ENV_KEY];
 	const { handlers, ctx } = setup(undefined);
 	assert.equal(await handlers.session_before_compact(compactEvt, ctx), undefined);
+	await tick();
 	assert.equal(ctx.calls.length, 1);
 	assert.match(ctx.calls[0].args[0] as string, /OPTOLLM_API_KEY/);
 	assert.equal(ctx.calls[0].args[1], "warning");
@@ -75,6 +81,7 @@ test("no config + missing key: native + one warn naming the env var", async () =
 	// new session warns again
 	await handlers.session_start({ type: "session_start", reason: "startup" }, ctx);
 	await handlers.session_before_compact(compactEvt, ctx);
+	await tick();
 	assert.equal(ctx.calls.length, 2);
 });
 
@@ -83,6 +90,7 @@ test("adding the key mid-session resumes the smart path (warn stops)", async () 
 	delete process.env[ENV_KEY];
 	const { handlers, ctx } = setup(undefined);
 	await handlers.session_before_compact(compactEvt, ctx);
+	await tick();
 	assert.equal(ctx.calls.length, 1);
 
 	process.env[ENV_KEY] = "sk-test";
@@ -115,6 +123,7 @@ test("invalid config: loud warn naming the problem + native, every case", async 
 	for (const [name, cfg, pattern] of cases) {
 		const { handlers, ctx } = setup(cfg);
 		assert.equal(await handlers.session_before_compact(compactEvt, ctx), undefined, name);
+		await tick();
 		assert.equal(ctx.calls.length, 1, `${name}: exactly one warn`);
 		assert.match(ctx.calls[0].args[0] as string, /invalid config/, name);
 		assert.match(ctx.calls[0].args[0] as string, pattern, name);
@@ -126,6 +135,7 @@ test("invalid config warns loud on every run (warn-once is rung 0 only)", async 
 	const { handlers, ctx } = setup({ mode: "fast" });
 	await handlers.session_before_compact(compactEvt, ctx);
 	await handlers.session_before_compact(compactEvt, ctx);
+	await tick();
 	assert.equal(ctx.calls.length, 2);
 });
 
@@ -142,6 +152,7 @@ test("tree navigation with summary runs the same shell", async () => {
 	delete process.env[ENV_KEY];
 	const { handlers, ctx } = setup(undefined);
 	assert.equal(await handlers.session_before_tree(treeEvt(true), ctx), undefined);
+	await tick();
 	assert.equal(ctx.calls.length, 1);
 	assert.match(ctx.calls[0].args[0] as string, /OPTOLLM_API_KEY/);
 });
@@ -228,6 +239,7 @@ test("shadow mode: pipeline runs, toast shows, telemetry record lands, native re
 		const result = await run(shadowPi(), ctx, new Set<string>(), regionEvt() as never, "compact", stubClient({ u_1_text: { type: "choice", choice: "summarize", confidence: 0.9 } }, clientCalls));
 		assert.equal(result, undefined); // shadow always returns native
 		assert.equal(clientCalls.n, 1);
+		await tick();
 		assert.deepEqual(calls[0][1], "info");
 		assert.match(String(calls[0][0]), /^smart-compact \[shadow\]: would keep 1 · summarize 1 · drop 0 .— native ran$/);
 		const file = join(dir, "smart-compact", "telemetry.jsonl");
@@ -248,6 +260,7 @@ test("shadow mode with malformed questions.json: loud warn + native, no client c
 		const result = await run(shadowPi(), ctx, new Set<string>(), regionEvt() as never, "compact", stubClient({}, clientCalls));
 		assert.equal(result, undefined);
 		assert.equal(clientCalls.n, 0, "no decision call");
+		await tick();
 		assert.equal(calls.length, 1);
 		assert.match(String(calls[0][0]), /questions\.json/);
 		assert.match(String(calls[0][0]), /not valid JSON/);
@@ -267,6 +280,7 @@ test("shadow branch summary: same pipeline, [shadow][branch] toast, kind=branch 
 			signal: new AbortController().signal,
 		};
 		await run(shadowPi(), ctx, new Set<string>(), treeEvt as never, "branch", stubClient({}, { n: 0 }));
+		await tick();
 		assert.match(String(calls[0][0]), /^smart-compact \[shadow\]\[branch\]/);
 		const record = JSON.parse(readFileSync(join(dir, "smart-compact", "telemetry.jsonl"), "utf8").trim());
 		assert.equal(record.kind, "branch");
@@ -282,6 +296,7 @@ test("shadow + transport failure: native, warn toast, rung-1 record", async () =
 			},
 		});
 		await run(shadowPi(), ctx, new Set<string>(), regionEvt() as never, "compact", makeFailing);
+		await tick();
 		assert.deepEqual(calls[0][1], "warning");
 		assert.match(String(calls[0][0]), /rung 1/);
 		const record = JSON.parse(readFileSync(join(dir, "smart-compact", "telemetry.jsonl"), "utf8").trim());

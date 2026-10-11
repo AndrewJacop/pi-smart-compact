@@ -94,6 +94,17 @@ export default function smartCompact(pi: ExtensionAPI) {
 type Kind = "compact" | "branch";
 
 /**
+ * §8.2's toast must SURVIVE pi's post-compaction transcript rebuild: the hook notifies while
+ * pi is still inside compact(), and compaction_end then clears + re-renders the chat (same for
+ * the tree-navigation rebuild), erasing the line before anyone can read it (found live on the
+ * 451-unit OPTOLINK run, 2026-10-07). Deferring by one macrotask lands the line after the
+ * rebuild — at the end of the transcript in the TUI, ~instantly in RPC/print modes.
+ */
+function deferredNotify(ctx: ExtensionContext, message: string, level: "info" | "warning"): void {
+	setTimeout(() => ctx.ui.notify(message, level), 0);
+}
+
+/**
  * The fallback shell. Gates in order; the smart path (shadow pipeline) sits behind
  * the last gate. Every gate failing, and any pipeline failure, fail open to native.
  */
@@ -117,7 +128,7 @@ export async function run(
 	if (!v.ok) {
 		// Fail loud: name the problem, smart path off, native compaction. Never guess.
 		// Loud means every run — warn-once is reserved for rung 0 (SPEC §8).
-		ctx.ui.notify(`smart-compact: invalid config — ${v.errors.join("; ")} — smart compaction off, using native compaction.`, "warning");
+		deferredNotify(ctx, `smart-compact: invalid config — ${v.errors.join("; ")} — smart compaction off, using native compaction.`, "warning");
 		return undefined;
 	}
 	const cfg = v.config;
@@ -130,7 +141,8 @@ export async function run(
 			? clampKeptRegion((event as SessionBeforeCompactEvent).branchEntries, (event as SessionBeforeCompactEvent).preparation.firstKeptEntryId, cfg.keptMessages)
 			: undefined;
 	if (clamp?.cancel) {
-		ctx.ui.notify(
+		deferredNotify(
+			ctx,
 			`smart-compact: keptMessages ${cfg.keptMessages} exempts every summarizable message — compaction cancelled. Size N so summary + kept region fit under the trigger threshold.`,
 			"warning",
 		);
@@ -148,7 +160,7 @@ export async function run(
 	// Question text: bundled defaults + validated global override; malformed → loud, smart off.
 	const q = loadQuestionSet({ defaultPath: DEFAULT_QUESTIONS, overridePath: overrideQuestionsPath() });
 	if (!q.ok) {
-		ctx.ui.notify(`smart-compact: invalid questions override — ${q.errors.join("; ")} — smart compaction off, using native compaction.`, "warning");
+		deferredNotify(ctx, `smart-compact: invalid questions override — ${q.errors.join("; ")} — smart compaction off, using native compaction.`, "warning");
 		return undefined;
 	}
 
@@ -164,7 +176,7 @@ export async function run(
 	if (cfg.mode === "live") {
 		const liveOpts = { backend: cfg.backend, matrix: cfg.matrix, minReductionPct: cfg.minReductionPct, privacy: cfg.privacy };
 		const notifyLive = (live: LiveResult) => {
-			if (live.toast) ctx.ui.notify(live.toast, live.outcome === "compacted" ? "info" : "warning");
+			if (live.toast) deferredNotify(ctx, live.toast, live.outcome === "compacted" ? "info" : "warning");
 		};
 		if (kind === "branch") {
 			// Branch summaries route through the SAME pipeline (ticket 07, SPEC §9): same matrix,
@@ -258,7 +270,7 @@ export async function run(
 		{ messages: messages as Array<Record<string, unknown>>, previousSummary, kind, signal: event.signal },
 	);
 
-	if (result.toast) ctx.ui.notify(result.toast, result.outcome === "fallback" ? "warning" : "info");
+	if (result.toast) deferredNotify(ctx, result.toast, result.outcome === "fallback" ? "warning" : "info");
 
 	// Shadow always returns native — decisions-only, the counterfactual lives in telemetry.
 	return undefined;
@@ -267,5 +279,5 @@ export async function run(
 function warnOnce(warned: Set<string>, key: string, message: string, ctx: ExtensionContext): void {
 	if (warned.has(key)) return;
 	warned.add(key);
-	ctx.ui.notify(message, "warning");
+	deferredNotify(ctx, message, "warning");
 }

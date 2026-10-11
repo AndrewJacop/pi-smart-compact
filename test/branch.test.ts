@@ -137,6 +137,11 @@ test("branch gate: minReductionPct still fails the rung on the region→composed
 
 // ---- shell wiring: live branch through run() ----
 
+/** Deferred toasts (§8.2, post-rebuild) land on a macrotask — flush before asserting. */
+function tick(ms = 20) {
+	return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 test("live branch: same pipeline summary labeled smart-compact, details file lists, kind=branch record, [branch] toast", async () => {
 	useKey();
 	try {
@@ -176,6 +181,7 @@ test("live branch: same pipeline summary labeled smart-compact, details file lis
 			assert.ok(String((capture.summarizeCalls[0].opts as { customInstructions: string }).customInstructions).includes(BRANCH_FOCUS));
 
 			// Toast + telemetry.
+			await tick();
 			assert.deepEqual(calls[0][1], "info");
 			assert.match(String(calls[0][0]), /^smart-compact \[branch\]: kept 3 · summarized 1 · dropped 2 — .+ → .+ tok \(−[\d.]+%\)$/);
 			const record = JSON.parse(readFileSync(join(dir, "smart-compact", "telemetry.jsonl"), "utf8").trim());
@@ -205,6 +211,7 @@ test("live branch fallback: decision failure → undefined (pi's native branch s
 			const result = await run(pi, ctx, new Set<string>(), treeEvt(), "branch", failing, stubMakeSummarizer(capture));
 			assert.equal(result, undefined, "fail-open → pi's native branch summary");
 			assert.equal(capture.summarizeCalls.length, 0);
+			await tick();
 			assert.deepEqual(calls[0][1], "warning");
 			assert.match(String(calls[0][0]), /^smart-compact \[branch\]: fell back to native \(rung 1/);
 			const record = JSON.parse(readFileSync(join(dir, "smart-compact", "telemetry.jsonl"), "utf8").trim());
@@ -226,6 +233,7 @@ test("live branch gate: minReductionPct 100 fails the rung even with clean decis
 			const capture: Capture = { requests: [], summarizeCalls: [] };
 			const result = await run(pi, ctx, new Set<string>(), treeEvt(), "branch", stubMakeClient(FIXTURE_ANSWERS, capture), stubMakeSummarizer(capture));
 			assert.equal(result, undefined);
+			await tick();
 			assert.match(String(calls[0][0]), /^smart-compact \[branch\]: fell back to native \(reduction .* below minReductionPct 100%\)$/);
 		});
 	} finally {
